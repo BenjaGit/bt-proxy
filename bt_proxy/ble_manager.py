@@ -155,6 +155,11 @@ class BLEConnection:
         return self._mtu_size
 
     def _disconnected_callback(self, client: BleakClient) -> None:
+        if client is not self.client:
+            # Every attempt shares this callback, so a client from an earlier
+            # (failed) attempt can report late, after a retry is already up.
+            logger.debug("Ignoring disconnect from a stale client for %s", self.mac)
+            return
         logger.info("Device %s disconnected", self.mac)
         self._notify_handles.clear()
         self._on_disconnect(self.address)
@@ -704,6 +709,14 @@ class BLEManager:
 
     def _handle_disconnect(self, address: int) -> None:
         """Internal disconnect handler."""
+        if address in self._connecting:
+            # connect_device() still owns this connection and reports the
+            # outcome itself; untracking it here orphans a later retry's link.
+            logger.debug(
+                "Disconnect during connect attempt for %s; retry loop handles it",
+                proto.int_to_mac(address),
+            )
+            return
         conn = self._connections.pop(address, None)
         if conn:
             # Schedule BlueZ cleanup in background
@@ -803,6 +816,9 @@ class BLEManager:
             for attempt in range(1, CONNECT_MAX_RETRIES + 1):
                 try:
                     await conn.connect(ble_device)
+                    # Re-assert tracking: whatever happened to earlier attempts,
+                    # this link must be findable by disconnect_device().
+                    self._connections[address] = conn
                     # Success clears any backoff and the wedge latch.
                     self._connect_backoff.pop(address, None)
                     self._daemon_wedge_logged = False
