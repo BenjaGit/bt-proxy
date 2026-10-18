@@ -20,6 +20,8 @@ logger = logging.getLogger(__name__)
 
 UNKNOWN_MAC = "00:00:00:00:00:00"
 BT_MAC_RETRY_INTERVAL = 5.0
+LOOPBACK_IP = "127.0.0.1"
+LOCAL_IP_RETRY_INTERVAL = 5.0
 
 
 def get_local_ip() -> str:
@@ -31,7 +33,7 @@ def get_local_ip() -> str:
         s.close()
         return ip
     except Exception:
-        return "127.0.0.1"
+        return LOOPBACK_IP
 
 
 def get_bt_mac(adapter: str | None = None) -> str:
@@ -80,11 +82,29 @@ async def wait_for_bt_mac(adapter: str | None = None) -> str:
     return mac
 
 
+async def wait_for_local_ip() -> str:
+    """Block until the host has a routable IPv4 address.
+
+    Starting before DHCP has finished would advertise the loopback fallback,
+    and Home Assistant could not discover the proxy until a restart.
+    """
+    ip = get_local_ip()
+    if ip != LOOPBACK_IP:
+        return ip
+    logger.warning(
+        f"No network address yet (is DHCP done?); retrying every "
+        f"{int(LOCAL_IP_RETRY_INTERVAL)}s"
+    )
+    while ip == LOOPBACK_IP:
+        await asyncio.sleep(LOCAL_IP_RETRY_INTERVAL)
+        ip = get_local_ip()
+    return ip
+
+
 async def register_mdns(
-    name: str, port: int, mac: str
+    name: str, port: int, mac: str, local_ip: str
 ) -> tuple[AsyncZeroconf, AsyncServiceInfo]:
     """Register the service via mDNS so Home Assistant can discover it."""
-    local_ip = get_local_ip()
     logger.info("Advertising mDNS on %s:%d", local_ip, port)
 
     # ESPHome devices advertise as _esphomelib._tcp.local.
@@ -128,7 +148,8 @@ async def async_main(args: argparse.Namespace) -> None:
     )
 
     # Register mDNS
-    zc, service_info = await register_mdns(args.name, args.port, bt_mac)
+    local_ip = await wait_for_local_ip()
+    zc, service_info = await register_mdns(args.name, args.port, bt_mac, local_ip)
 
     # Start BLE scanning
     await ble_manager.start_scanning()
