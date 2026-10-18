@@ -3,15 +3,22 @@
 #
 # Brug (på Pi'en, som brugeren benjamin med sudo):
 #   NAME=bt-proxy-2 FRIENDLY="BT Proxy 2" NET=eth bash setup-pi.sh
+#   NAME=bt-proxy-2 FRIENDLY="BT Proxy 2" NET=vlan KEEPWIFI=1 bash setup-pi.sh
 #   NAME=bt-proxy-3 FRIENDLY="BT Proxy 3" NET=wifi USBWIFI=1 bash setup-pi.sh
 #
 # Køres via systemd-run, så det overlever, at SSH-sessionen lukker. Kopiér scriptet
 # over med scp.
 #
 # NET:
-#   eth     kabel med IoT som utagget netværk. Pi'en tagger ikke selv VLAN'er; bag en
-#           AP-port sættes switchportens native VLAN til IoT (UniFi's client network
-#           override virker ikke bag en AP-bro). WiFi slås fra.
+#   eth     kabel med IoT som utagget netværk (switchportens Native VLAN / Network =
+#           40 - IoT). Kun på en port, Pi'en har for sig selv. WiFi slås fra.
+#   vlan    kabel, hvor Pi'en selv tagger VLAN $VLAN (standard 40) på eth0.$VLAN med
+#           DHCP, og det utaggede eth0 får ingen IPv4. Brug det bag en AP-port: AP'ens
+#           port skal beholde Native VLAN / Network = Default (1) og Tagged VLAN
+#           Management = Allow All. Med IoT som native mister AP'ens WiFi-klienter på
+#           IoT forbindelsen, og UniFi's client network override virker ikke bag en
+#           AP-bro. Det utaggede eth0 slås fra til sidst; står porten stadig på IoT som
+#           native, er Pi'en væk, indtil porten er rettet. WiFi slås fra.
 #   wifi    WiFi skal allerede være forbundet, f.eks. via Raspberry Pi Imager: til
 #           Coldberg_IoT5 (5 GHz) med den indbyggede WiFi, eller til Coldberg_IoT
 #           (2,4 GHz) med USBWIFI=1. Strømsparing slås fra.
@@ -22,20 +29,36 @@
 #           og DHCP-reservationen skal laves på den MAC, scriptet skriver ud.
 # DONGLE=1  brug en USB-Bluetooth-dongle og slå den indbyggede Bluetooth fra
 #           (dtoverlay=disable-bt), så dongle'en bliver hci0. Kræver genstart.
+# KEEPWIFI=1 (eth/vlan) lad den indbyggede WiFi blive tændt som reserveadgang. Den
+#           skal allerede være forbundet til Coldberg_IoT; kablet vinder på rute-metric.
 set -u
 : "${NAME:?NAME mangler, f.eks. bt-proxy-2}"
 : "${FRIENDLY:?FRIENDLY mangler, f.eks. \"BT Proxy 2\"}"
-: "${NET:?NET mangler: eth eller wifi}"
+: "${NET:?NET mangler: eth, vlan eller wifi}"
 DONGLE="${DONGLE:-0}"
 USBWIFI="${USBWIFI:-0}"
+KEEPWIFI="${KEEPWIFI:-0}"
+VLAN="${VLAN:-40}"
 [ "$USBWIFI" = 1 ] && [ "$NET" != wifi ] && { echo "USBWIFI=1 kræver NET=wifi"; exit 1; }
+[ "$KEEPWIFI" = 1 ] && [ "$NET" = wifi ] && { echo "KEEPWIFI=1 giver kun mening med NET=eth eller vlan"; exit 1; }
 [ "$USBWIFI" = 1 ] && [ "$DONGLE" = 1 ] && { echo "Vælg enten USBWIFI=1 eller DONGLE=1"; exit 1; }
 MAC_IF=eth0
 TAG="${TAG:-v1.0.3-benjagit.3}"
 HA_IP="${HA_IP:-192.168.40.2}"
 CFG=/boot/firmware/config.txt
 REBOOT=0
+UNTAGGED_CON=""
 step() { echo; echo "=== $*"; }
+wifi_off() {
+  if [ "$KEEPWIFI" = 1 ]; then
+    grep -q '^dtoverlay=disable-wifi' "$CFG" && { sudo sed -i 's/^dtoverlay=disable-wifi/#dtoverlay=disable-wifi/' "$CFG"; REBOOT=1; }
+    sudo nmcli radio wifi on && echo "nmcli: wifi on (reserve)"
+    nmcli -t -f NAME,DEVICE con show --active | grep wlan0 || echo "ADVARSEL: wlan0 er ikke forbundet"
+    return
+  fi
+  sudo nmcli radio wifi off && echo "nmcli: wifi off"
+  grep -q '^dtoverlay=disable-wifi' "$CFG" || { echo 'dtoverlay=disable-wifi' | sudo tee -a "$CFG"; REBOOT=1; }
+}
 
 step "System"
 # Subshell: os-release definerer selv NAME og ville overskrive vores.
@@ -46,8 +69,21 @@ sudo hostnamectl set-hostname "$NAME" && echo "hostname: $NAME"
 step "Netværk ($NET)"
 case "$NET" in
   eth)
-    sudo nmcli radio wifi off && echo "nmcli: wifi off"
-    grep -q '^dtoverlay=disable-wifi' "$CFG" || { echo 'dtoverlay=disable-wifi' | sudo tee -a "$CFG"; REBOOT=1; }
+    wifi_off
+    ;;
+  vlan)
+    wifi_off
+    UNTAGGED_CON=$(nmcli -t -f NAME,TYPE,DEVICE con show | awk -F: '$2=="802-3-ethernet" && $3=="eth0"{print $1; exit}')
+    [ -n "$UNTAGGED_CON" ] || { echo "Ingen aktiv kabelforbindelse på eth0"; exit 1; }
+    # Uendelig DHCP-ventetid: porten kan stå forkert lige nu og blive rettet bagefter.
+    VLAN_OPTS=(ipv4.method auto ipv6.method ignore connection.autoconnect yes
+      connection.autoconnect-retries 0 ipv4.dhcp-timeout infinity)
+    if nmcli -t -f NAME con show | grep -qx "vlan$VLAN"; then
+      sudo nmcli con modify "vlan$VLAN" "${VLAN_OPTS[@]}"
+    else
+      sudo nmcli con add type vlan con-name "vlan$VLAN" ifname "eth0.$VLAN" dev eth0 id "$VLAN" "${VLAN_OPTS[@]}"
+    fi
+    echo "vlan$VLAN: eth0.$VLAN med DHCP. '$UNTAGGED_CON' mister sin IPv4 til sidst."
     ;;
   wifi)
     CON=$(nmcli -t -f NAME,TYPE con show --active | awk -F: '$2=="802-11-wireless"{print $1; exit}')
@@ -165,5 +201,15 @@ journalctl -u bt-proxy -n 15 --no-pager
 ip -4 -br addr | grep -v '^lo'
 ip link show "$MAC_IF" | awk -v i="$MAC_IF" '/ether/{print i, "MAC (til DHCP-reservation):", $2}'
 [ "$USBWIFI" = 1 ] && echo "Bluetooth bliver på den indbyggede chip (hci0); tjek efter genstarten: ls /sys/class/bluetooth"
+if [ -n "$UNTAGGED_CON" ]; then
+  # Til sidst, så alt ovenfor er skrevet ud, før en forkert sat port tager Pi'en af nettet.
+  step "Utagget eth0 ('$UNTAGGED_CON'): ingen IPv4"
+  sudo nmcli con modify "$UNTAGGED_CON" ipv4.method disabled ipv6.method ignore
+  sudo nmcli con up "$UNTAGGED_CON" >/dev/null
+  sleep 10
+  ip -4 -br addr | grep -v '^lo'
+  ip -4 addr show "eth0.$VLAN" | grep -q inet \
+    || echo "ADVARSEL: eth0.$VLAN har ingen IP endnu. AP-/switchporten skal have Native VLAN / Network = Default (1) og Tagged VLAN Management = Allow All."
+fi
 [ "$REBOOT" = 1 ] && echo && echo ">>> config.txt er ændret: kør 'sudo reboot'."
 exit 0
