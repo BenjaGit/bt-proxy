@@ -38,12 +38,16 @@ logger = logging.getLogger(__name__)
 
 # Default MTU for BLE connections
 DEFAULT_MTU = 23
-MTU_ACQUIRE_TIMEOUT = 10.0
+MTU_ACQUIRE_TIMEOUT = 3.0
 
-# Connection retry settings
-CONNECT_TIMEOUT = 30.0
+# Connection retry settings. Home Assistant (aioesphomeapi) waits 20 s for the
+# answer to a connect request and retries on its own (bleak_retry_connector),
+# so one attempt that answers within that window beats internal retries whose
+# late success nobody is waiting for: CONNECT_TIMEOUT + MTU_ACQUIRE_TIMEOUT
+# must stay below 20 s.
+CONNECT_TIMEOUT = 15.0
 CONNECT_RETRY_DELAY = 2.0
-CONNECT_MAX_RETRIES = 3
+CONNECT_MAX_RETRIES = 1
 
 # Per-device connect-failure backoff. Home Assistant retries failed connections
 # aggressively; without a brake we relay every retry straight to BlueZ and the
@@ -756,7 +760,11 @@ class BLEManager:
                     f"{int(delay)}s between attempts until it recovers."
                 )
         else:
-            delay = min(CONNECT_FAIL_BACKOFF_MAX, CONNECT_FAIL_BACKOFF_STEP * fails)
+            # The first failure is not throttled: Home Assistant retries it
+            # right away, and refusing that retry only wastes the poll.
+            delay = min(
+                CONNECT_FAIL_BACKOFF_MAX, CONNECT_FAIL_BACKOFF_STEP * (fails - 1)
+            )
 
         self._connect_backoff[address] = (fails, time.monotonic() + delay)
         logger.error(
@@ -833,8 +841,6 @@ class BLEManager:
                         mac,
                         err_str,
                     )
-                    if attempt >= CONNECT_MAX_RETRIES:
-                        break
                     if _is_daemon_wedge_error(e):
                         # Retrying a wedged daemon just churns (and bluetoothctl
                         # cleanup would hang on NoReply); stop and let the hard
@@ -843,9 +849,13 @@ class BLEManager:
                     if "InProgress" in err_str:
                         # BlueZ still has stale state for this device — clear it
                         # and let the always-on scanner re-populate the cache.
+                        # Also on the last attempt, so the next request starts
+                        # clean.
                         await self._bluez_remove_device(mac)
                         self._device_cache.pop(mac.upper(), None)
                         ble_device = None
+                    if attempt >= CONNECT_MAX_RETRIES:
+                        break
                     await asyncio.sleep(CONNECT_RETRY_DELAY)
                     # The scanner stays running, so re-check the cache in case it
                     # (re)discovered the device while we waited.
