@@ -3,7 +3,7 @@
 #
 # Brug (på Pi'en, som brugeren benjamin med sudo):
 #   NAME=bt-proxy-2 FRIENDLY="BT Proxy 2" NET=eth bash setup-pi.sh
-#   NAME=bt-proxy-3 FRIENDLY="BT Proxy 3" NET=wifi DONGLE=1 bash setup-pi.sh
+#   NAME=bt-proxy-3 FRIENDLY="BT Proxy 3" NET=wifi USBWIFI=1 bash setup-pi.sh
 #
 # Køres via systemd-run, så det overlever, at SSH-sessionen lukker. Kopiér scriptet
 # over med scp.
@@ -12,8 +12,14 @@
 #   eth     kabel med IoT som utagget netværk. Pi'en tagger ikke selv VLAN'er; bag en
 #           AP-port sættes switchportens native VLAN til IoT (UniFi's client network
 #           override virker ikke bag en AP-bro). WiFi slås fra.
-#   wifi    WiFi skal allerede være forbundet til Coldberg_IoT5 (5 GHz), f.eks. via
-#           Raspberry Pi Imager. Forbindelsen låses til 5 GHz, og strømsparing slås fra.
+#   wifi    WiFi skal allerede være forbundet, f.eks. via Raspberry Pi Imager: til
+#           Coldberg_IoT5 (5 GHz) med den indbyggede WiFi, eller til Coldberg_IoT
+#           (2,4 GHz) med USBWIFI=1. Strømsparing slås fra.
+# USBWIFI=1 WiFi via en USB-adapter (f.eks. RTL8192EU, driver rtl8xxxu), så den
+#           indbyggede chip kun laver Bluetooth. Den indbyggede WiFi slås fra
+#           (dtoverlay=disable-wifi), og forbindelsen bindes til adapterens MAC, fordi
+#           adapteren skifter navn fra wlan1 til wlan0 ved genstarten. Kræver genstart,
+#           og DHCP-reservationen skal laves på den MAC, scriptet skriver ud.
 # DONGLE=1  brug en USB-Bluetooth-dongle og slå den indbyggede Bluetooth fra
 #           (dtoverlay=disable-bt), så dongle'en bliver hci0. Kræver genstart.
 set -u
@@ -21,6 +27,10 @@ set -u
 : "${FRIENDLY:?FRIENDLY mangler, f.eks. \"BT Proxy 2\"}"
 : "${NET:?NET mangler: eth eller wifi}"
 DONGLE="${DONGLE:-0}"
+USBWIFI="${USBWIFI:-0}"
+[ "$USBWIFI" = 1 ] && [ "$NET" != wifi ] && { echo "USBWIFI=1 kræver NET=wifi"; exit 1; }
+[ "$USBWIFI" = 1 ] && [ "$DONGLE" = 1 ] && { echo "Vælg enten USBWIFI=1 eller DONGLE=1"; exit 1; }
+MAC_IF=eth0
 TAG="${TAG:-v1.0.3-benjagit.3}"
 HA_IP="${HA_IP:-192.168.40.2}"
 CFG=/boot/firmware/config.txt
@@ -41,11 +51,33 @@ case "$NET" in
     ;;
   wifi)
     CON=$(nmcli -t -f NAME,TYPE con show --active | awk -F: '$2=="802-11-wireless"{print $1; exit}')
-    [ -n "$CON" ] || { echo "Ingen aktiv WiFi-forbindelse. Forbind til Coldberg_IoT5 først."; exit 1; }
-    sudo nmcli con modify "$CON" 802-11-wireless.band a 802-11-wireless.powersave 2
-    sudo nmcli con up "$CON" >/dev/null
-    iw dev wlan0 link | grep -E 'SSID|freq|signal'
-    iw dev wlan0 link | awk '/freq/{exit !($2 >= 5000)}' || { echo "ADVARSEL: ikke på 5 GHz"; }
+    [ -n "$CON" ] || { echo "Ingen aktiv WiFi-forbindelse. Forbind til Coldberg_IoT(5) først."; exit 1; }
+    SSID=$(nmcli -g 802-11-wireless.ssid con show "$CON")
+    MAC_IF=wlan0
+    if [ "$USBWIFI" = 1 ]; then
+      # USB-adapteren er det trådløse interface, hvis driver ikke er Pi'ens brcmfmac.
+      USB_IF=""
+      for d in /sys/class/net/*/wireless; do
+        IF=$(basename "$(dirname "$d")")
+        DRV=$(basename "$(readlink "/sys/class/net/$IF/device/driver")")
+        [ "$DRV" != brcmfmac ] && { USB_IF=$IF; echo "USB-WiFi: $IF ($DRV)"; }
+      done
+      [ -n "$USB_IF" ] || { echo "Ingen USB-WiFi-adapter fundet (lsusb):"; lsusb; exit 1; }
+      [ "$SSID" = Coldberg_IoT5 ] && { echo "Adapteren kan kun 2,4 GHz: forbind til Coldberg_IoT, ikke Coldberg_IoT5."; exit 1; }
+      USB_MAC=$(cat "/sys/class/net/$USB_IF/address")
+      # Bind til MAC'en, ikke navnet: adapteren hedder wlan0 efter genstarten.
+      sudo nmcli con modify "$CON" connection.interface-name "" \
+        802-11-wireless.mac-address "$USB_MAC" 802-11-wireless.cloned-mac-address permanent \
+        802-11-wireless.band bg 802-11-wireless.powersave 2
+      grep -q '^dtoverlay=disable-wifi' "$CFG" || { echo 'dtoverlay=disable-wifi' | sudo tee -a "$CFG"; REBOOT=1; }
+      MAC_IF=$USB_IF
+      echo "Forbindelsen '$CON' ($SSID) tager over på $USB_IF ved genstarten."
+    else
+      sudo nmcli con modify "$CON" 802-11-wireless.band a 802-11-wireless.powersave 2
+      sudo nmcli con up "$CON" >/dev/null
+      iw dev wlan0 link | grep -E 'SSID|freq|signal'
+      iw dev wlan0 link | awk '/freq/{exit !($2 >= 5000)}' || { echo "ADVARSEL: ikke på 5 GHz"; }
+    fi
     ;;
   *) echo "Ukendt NET=$NET"; exit 1 ;;
 esac
@@ -131,7 +163,7 @@ systemctl is-active bluetooth nftables bt-proxy bt-proxy-watchdog.timer
 sudo nft list ruleset | grep 6053
 journalctl -u bt-proxy -n 15 --no-pager
 ip -4 -br addr | grep -v '^lo'
-IF=eth0; [ "$NET" = wifi ] && IF=wlan0
-ip link show "$IF" | awk -v i="$IF" '/ether/{print i, "MAC (til DHCP-reservation):", $2}'
+ip link show "$MAC_IF" | awk -v i="$MAC_IF" '/ether/{print i, "MAC (til DHCP-reservation):", $2}'
+[ "$USBWIFI" = 1 ] && echo "Bluetooth bliver på den indbyggede chip (hci0); tjek efter genstarten: ls /sys/class/bluetooth"
 [ "$REBOOT" = 1 ] && echo && echo ">>> config.txt er ændret: kør 'sudo reboot'."
 exit 0
