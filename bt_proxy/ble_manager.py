@@ -55,10 +55,13 @@ CONNECT_MAX_RETRIES = 1
 # retry gets too little of its 20 s to catch the device again. Seen with Danfoss
 # eTRVs, which often answer a fresh attempt a few seconds later. Such attempts
 # are retried here, within the CONNECT_TIMEOUT budget of the one request. An
-# attempt needs at least one advertisement to connect on (an eTRV advertises
-# about every 4 s), so no new attempt starts with less than that left.
+# attempt waits for an advertisement to connect on (an eTRV advertises about
+# every 4 s, sometimes only every 8 s) and then needs about 5.5 s for service
+# discovery, which BleakClient.connect() includes. A retry started with less
+# than that left gets cut off mid-discovery: it wakes the valve for nothing and
+# answers Home Assistant later than failing at once would.
 DROP_RETRY_DELAY = 0.5
-DROP_RETRY_MIN_REMAINING = 5.0
+DROP_RETRY_MIN_REMAINING = 10.0
 
 # Per-device connect-failure backoff. Home Assistant retries failed connections
 # aggressively; without a brake we relay every retry straight to BlueZ and the
@@ -902,7 +905,8 @@ class BLEManager:
                         isinstance(e, LinkDroppedWhileConnecting)
                         or "not found" in err_str
                     ):
-                        if deadline - time.monotonic() < DROP_RETRY_MIN_REMAINING:
+                        left = deadline - time.monotonic() - DROP_RETRY_DELAY
+                        if left < DROP_RETRY_MIN_REMAINING:
                             break
                         await asyncio.sleep(DROP_RETRY_DELAY)
                         ble_device = self._device_cache.get(mac.upper())

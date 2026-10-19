@@ -177,6 +177,25 @@ def test_a_link_dropped_while_connecting_is_retried_at_once(manager):
     assert manager.get_connection(ADDRESS) is not None
 
 
+def test_no_retry_without_room_to_finish(manager, monkeypatch):
+    # A retry that cannot finish before the deadline is cut off mid-discovery
+    # (seen on hardware: link up, then dropped by the host 5 s into service
+    # discovery). Failing at once lets Home Assistant retry with a fresh budget.
+    monkeypatch.setattr(ble_manager, "CONNECT_TIMEOUT", 0.3)
+    monkeypatch.setattr(ble_manager, "DROP_RETRY_DELAY", 0.1)
+    monkeypatch.setattr(ble_manager, "DROP_RETRY_MIN_REMAINING", 0.25)
+    FakeClient.script = ["drop", "ok"]
+    ok, _mtu, _error = asyncio.run(manager.connect_device(ADDRESS))
+    assert not ok
+    assert len(FakeClient.instances) == 1
+
+
+def test_a_retry_has_room_for_an_advertisement_and_discovery():
+    # Measured on Danfoss eTRVs: up to 4 s waiting for an advertisement and
+    # about 5.5 s of service discovery inside BleakClient.connect().
+    assert ble_manager.DROP_RETRY_MIN_REMAINING >= 4.0 + 5.5
+
+
 def test_not_found_after_a_dropped_link_is_retried(manager):
     FakeClient.script = ["drop", "notfound", "ok"]
     ok, _mtu, _error = asyncio.run(manager.connect_device(ADDRESS))
