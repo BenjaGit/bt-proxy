@@ -49,6 +49,17 @@ CONNECT_TIMEOUT = 15.0
 CONNECT_RETRY_DELAY = 2.0
 CONNECT_MAX_RETRIES = 1
 
+# A link that comes up and drops before connect() returns (HCI 0x3E, "connection
+# failed to be established": the peripheral never answered the first connection
+# events) leaves connect() waiting out CONNECT_TIMEOUT, so Home Assistant's own
+# retry gets too little of its 20 s to catch the device again. Seen with Danfoss
+# eTRVs, which often answer a fresh attempt a few seconds later. Such attempts
+# are retried here, within the CONNECT_TIMEOUT budget of the one request. An
+# attempt needs at least one advertisement to connect on (an eTRV advertises
+# about every 4 s), so no new attempt starts with less than that left.
+DROP_RETRY_DELAY = 0.5
+DROP_RETRY_MIN_REMAINING = 5.0
+
 # Per-device connect-failure backoff. Home Assistant retries failed connections
 # aggressively; without a brake we relay every retry straight to BlueZ and the
 # controller, and that churn can tip a flaky single-radio adapter over the edge
@@ -133,6 +144,10 @@ def _is_daemon_wedge_error(error: Exception | None) -> bool:
     return "phantom" in err or "NoReply" in err or "Not connected" in err
 
 
+class LinkDroppedWhileConnecting(BleakError):
+    """The link came up and went down again before connect() returned."""
+
+
 class BLEConnection:
     """Manages a single active BLE GATT connection."""
 
@@ -149,6 +164,7 @@ class BLEConnection:
         self._on_disconnect = on_disconnect
         self._on_notify = on_notify
         self._notify_handles: set[int] = set()
+        self._dropped_while_connecting: asyncio.Event | None = None
 
     @property
     def connected(self) -> bool:
@@ -164,24 +180,56 @@ class BLEConnection:
             # (failed) attempt can report late, after a retry is already up.
             logger.debug("Ignoring disconnect from a stale client for %s", self.mac)
             return
+        if self._dropped_while_connecting is not None:
+            # connect() is still waiting; let it give up now.
+            self._dropped_while_connecting.set()
         logger.info("Device %s disconnected", self.mac)
         self._notify_handles.clear()
         self._on_disconnect(self.address)
 
-    async def connect(self, ble_device: BLEDevice | None = None) -> None:
+    async def connect(
+        self, ble_device: BLEDevice | None = None, timeout: float | None = None
+    ) -> None:
         """Connect to the BLE device.
 
         If ble_device is provided (from scanner cache), use it directly.
-        Otherwise fall back to MAC string.
+        Otherwise fall back to MAC string. Raises LinkDroppedWhileConnecting as
+        soon as the link drops before connect() returns, rather than waiting
+        out the timeout.
         """
+        timeout = CONNECT_TIMEOUT if timeout is None else timeout
         logger.info("Connecting to %s", self.mac)
         target: BLEDevice | str = ble_device if ble_device else self.mac
         self.client = BleakClient(
             target,
             disconnected_callback=self._disconnected_callback,
-            timeout=CONNECT_TIMEOUT,
+            timeout=timeout,
         )
-        await self.client.connect()
+        dropped = self._dropped_while_connecting = asyncio.Event()
+        connecting = asyncio.ensure_future(self.client.connect())
+        watching = asyncio.ensure_future(dropped.wait())
+        try:
+            done, _ = await asyncio.wait(
+                {connecting, watching},
+                timeout=timeout,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+        finally:
+            self._dropped_while_connecting = None
+            watching.cancel()
+        if connecting not in done:
+            connecting.cancel()
+            await asyncio.gather(connecting, return_exceptions=True)
+            try:
+                await self.client.disconnect()
+            except Exception:  # noqa: BLE001 - best effort, the link is gone
+                pass
+            if dropped.is_set():
+                raise LinkDroppedWhileConnecting(
+                    f"{self.mac} dropped the link while connecting"
+                )
+            raise TimeoutError(f"connect to {self.mac} timed out after {timeout:.0f}s")
+        connecting.result()
         await self._acquire_mtu()
         # A genuine connection is actually connected once connect() returns.
         # If BlueZ reports success but the link isn't really up (a phantom
@@ -739,7 +787,11 @@ class BLEManager:
         return max(0.0, next_ts - time.monotonic())
 
     def _note_connect_failure(
-        self, address: int, mac: str, error: Exception | None
+        self,
+        address: int,
+        mac: str,
+        error: Exception | None,
+        attempts: int = CONNECT_MAX_RETRIES,
     ) -> None:
         """Log a failed connect and extend this device's backoff window."""
         fails = self._connect_backoff.get(address, (0, 0.0))[0] + 1
@@ -768,7 +820,7 @@ class BLEManager:
 
         self._connect_backoff[address] = (fails, time.monotonic() + delay)
         logger.error(
-            f"Failed to connect to {mac} after {CONNECT_MAX_RETRIES} attempts: "
+            f"Failed to connect to {mac} after {attempts} attempt(s): "
             f"{error} (next attempt blocked for {int(delay)}s)"
         )
 
@@ -821,9 +873,15 @@ class BLEManager:
             self._connections[address] = conn
 
             last_error: Exception | None = None
-            for attempt in range(1, CONNECT_MAX_RETRIES + 1):
+            deadline = time.monotonic() + CONNECT_TIMEOUT
+            dropped = False
+            attempt = 0
+            while True:
+                attempt += 1
                 try:
-                    await conn.connect(ble_device)
+                    await conn.connect(
+                        ble_device, timeout=max(0.0, deadline - time.monotonic())
+                    )
                     # Re-assert tracking: whatever happened to earlier attempts,
                     # this link must be findable by disconnect_device().
                     self._connections[address] = conn
@@ -835,12 +893,20 @@ class BLEManager:
                     last_error = e
                     err_str = str(e)
                     logger.warning(
-                        "Connect attempt %d/%d to %s failed: %s",
-                        attempt,
-                        CONNECT_MAX_RETRIES,
-                        mac,
-                        err_str,
+                        "Connect attempt %d to %s failed: %s", attempt, mac, err_str
                     )
+                    # A dropped link, and BlueZ forgetting the device right
+                    # after one, are retried within this request's budget.
+                    dropped = dropped or isinstance(e, LinkDroppedWhileConnecting)
+                    if dropped and (
+                        isinstance(e, LinkDroppedWhileConnecting)
+                        or "not found" in err_str
+                    ):
+                        if deadline - time.monotonic() < DROP_RETRY_MIN_REMAINING:
+                            break
+                        await asyncio.sleep(DROP_RETRY_DELAY)
+                        ble_device = self._device_cache.get(mac.upper())
+                        continue
                     if _is_daemon_wedge_error(e):
                         # Retrying a wedged daemon just churns (and bluetoothctl
                         # cleanup would hang on NoReply); stop and let the hard
@@ -863,7 +929,7 @@ class BLEManager:
                         ble_device = self._device_cache.get(mac.upper())
 
             # All retries exhausted — record the failure and arm the backoff.
-            self._note_connect_failure(address, mac, last_error)
+            self._note_connect_failure(address, mac, last_error, attempt)
             self._connections.pop(address, None)
             return False, 0, -1
         finally:

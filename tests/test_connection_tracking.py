@@ -8,6 +8,7 @@ Run: uv run --with pytest python -m pytest tests/
 """
 
 import asyncio
+import time
 
 import pytest
 from bleak.exc import BleakError
@@ -37,6 +38,17 @@ class FakeClient:
             # BlueZ reports the aborted link before connect() raises.
             self._callback(self)
             raise BleakError("[org.bluez.Error.Failed] br-connection-canceled")
+        if step == "drop":
+            # Seen with Danfoss eTRVs: the link comes up, the valve never answers
+            # (HCI 0x3E after six connection events), BlueZ reports the
+            # disconnect, and connect() keeps waiting until its timeout.
+            self._callback(self)
+            await asyncio.Event().wait()
+        if step == "notfound":
+            # Right after a dropped link BlueZ has forgotten the device.
+            raise BleakError("device 'dev_00_04_2F_0F_09_A2' not found")
+        if step == "hang":
+            await asyncio.Event().wait()
         self.is_connected = True
 
     async def disconnect(self):
@@ -145,6 +157,51 @@ def test_first_failure_does_not_block_the_next_request(manager):
     FakeClient.script = ["fail"]
     asyncio.run(manager.connect_device(ADDRESS))
     assert manager._connect_backoff_remaining(ADDRESS) > 0
+
+
+def _timed(coro):
+    start = time.monotonic()
+    result = asyncio.run(coro)
+    return result, time.monotonic() - start
+
+
+def test_a_link_dropped_while_connecting_is_retried_at_once(manager):
+    # Waiting out CONNECT_TIMEOUT after the link is already gone leaves Home
+    # Assistant's own retry too little time to connect; a fresh attempt right
+    # away often succeeds.
+    FakeClient.script = ["drop", "ok"]
+    (ok, _mtu, error), elapsed = _timed(manager.connect_device(ADDRESS))
+    assert ok and error == 0
+    assert len(FakeClient.instances) == 2
+    assert elapsed < 1.0
+    assert manager.get_connection(ADDRESS) is not None
+
+
+def test_not_found_after_a_dropped_link_is_retried(manager):
+    FakeClient.script = ["drop", "notfound", "ok"]
+    ok, _mtu, _error = asyncio.run(manager.connect_device(ADDRESS))
+    assert ok
+    assert len(FakeClient.instances) == 3
+
+
+def test_dropped_link_retries_stop_at_the_deadline(manager, monkeypatch):
+    monkeypatch.setattr(ble_manager, "CONNECT_TIMEOUT", 0.3)
+    monkeypatch.setattr(ble_manager, "DROP_RETRY_DELAY", 0.05)
+    monkeypatch.setattr(ble_manager, "DROP_RETRY_MIN_REMAINING", 0.05)
+    FakeClient.script = ["drop"] * 50
+    (ok, _mtu, _error), elapsed = _timed(manager.connect_device(ADDRESS))
+    assert not ok
+    assert elapsed < 0.3 + 0.2
+    assert 2 <= len(FakeClient.instances) < 10
+
+
+def test_a_hanging_connect_gives_up_after_connect_timeout(manager, monkeypatch):
+    monkeypatch.setattr(ble_manager, "CONNECT_TIMEOUT", 0.2)
+    FakeClient.script = ["hang"]
+    (ok, _mtu, _error), elapsed = _timed(manager.connect_device(ADDRESS))
+    assert not ok
+    assert 0.2 <= elapsed < 0.4
+    assert len(FakeClient.instances) == 1
 
 
 def test_in_progress_state_is_cleared_even_on_the_last_attempt(manager, monkeypatch):
