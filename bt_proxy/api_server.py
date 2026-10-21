@@ -15,6 +15,11 @@ logger = logging.getLogger(__name__)
 # How often to flush batched advertisements (seconds)
 ADV_BATCH_INTERVAL = 0.1
 
+# Drop a client that has sent nothing for this long. Home Assistant pings
+# every ~20 s, so silence means the link is gone (e.g. WiFi dropped) even if
+# TCP has not noticed yet - and until we notice, its BLE links stay up.
+CLIENT_IDLE_TIMEOUT = 90.0
+
 
 class APIConnection:
     """A single client connection to the ESPHome Native API."""
@@ -34,6 +39,10 @@ class APIConnection:
         self._adv_flush_task: asyncio.Task[None] | None = None
         self._closed = False
         self._peer = writer.get_extra_info("peername", ("unknown", 0))
+        # BLE links this client brought up; torn down if the client goes away
+        # without asking, or the peripheral would stay connected (and stop
+        # advertising) with nobody left to release it.
+        self._owned: set[int] = set()
 
     async def run(self) -> None:
         """Main loop: read and dispatch messages from the client."""
@@ -72,10 +81,18 @@ class APIConnection:
             await self._handle_message(msg_type, data)
 
             while not self._closed:
-                msg_type, data = await self._read_message()
+                msg_type, data = await asyncio.wait_for(
+                    self._read_message(), CLIENT_IDLE_TIMEOUT
+                )
                 await self._handle_message(msg_type, data)
         except (asyncio.IncompleteReadError, ConnectionResetError, OSError):
             logger.info("Client %s disconnected", self._peer)
+        except asyncio.TimeoutError:
+            logger.warning(
+                "Client %s silent for %.0f s, dropping it",
+                self._peer,
+                CLIENT_IDLE_TIMEOUT,
+            )
         except Exception:
             logger.exception("Error handling client %s", self._peer)
         finally:
@@ -231,6 +248,8 @@ class APIConnection:
             proto.BLE_REQUEST_CONNECT_V3_WITHOUT_CACHE,
         ):
             success, mtu, error = await ble.connect_device(address)
+            if success:
+                self._owned.add(address)
             resp = proto.encode_ble_device_connection_response(
                 address, success, mtu, error
             )
@@ -239,6 +258,7 @@ class APIConnection:
                 self._send_connections_free()
 
         elif request_type == proto.BLE_REQUEST_DISCONNECT:
+            self._owned.discard(address)
             await ble.disconnect_device(address)
             resp = proto.encode_ble_device_connection_response(
                 address, False, 0, 0
@@ -442,6 +462,7 @@ class APIConnection:
 
     def push_disconnect(self, address: int) -> None:
         """Notify client of a device disconnection."""
+        self._owned.discard(address)
         resp = proto.encode_ble_device_connection_response(
             address, False, 0, 0
         )
@@ -529,6 +550,21 @@ class APIConnection:
             pass
         # Remove ourselves from the server's connection list
         self.server.remove_connection(self)
+        await self._release_owned()
+
+    async def _release_owned(self) -> None:
+        """Disconnect every BLE link this client left behind."""
+        owned, self._owned = self._owned, set()
+        for address in owned:
+            logger.warning(
+                "Client %s went away holding %016X - disconnecting it",
+                self._peer,
+                address,
+            )
+            try:
+                await self.server.ble_manager.disconnect_device(address)
+            except Exception:
+                logger.exception("Could not disconnect %016X", address)
 
 
 # Handler dispatch table
