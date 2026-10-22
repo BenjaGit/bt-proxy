@@ -92,12 +92,50 @@ def test_dropped_client_releases_its_links():
     assert ble.connected == set()
 
 
-def test_silent_client_is_dropped_and_releases_its_links(monkeypatch):
+def test_silent_client_is_pinged_then_dropped_and_releases_its_links(monkeypatch):
     # WiFi gone: no EOF, no reset, just silence.
-    monkeypatch.setattr(api_server, "CLIENT_IDLE_TIMEOUT", 0.05)
+    monkeypatch.setattr(api_server, "PING_INTERVAL", 0.02)
+    monkeypatch.setattr(api_server, "CLIENT_IDLE_TIMEOUT", 0.1)
     ble = FakeBLE()
     feed = _frame(proto.MSG_BLE_DEVICE_REQUEST, _connect_request(ADDRESS))
-    asyncio.run(_run_client(feed, eof=False, ble=ble))
+    conn = asyncio.run(_run_client(feed, eof=False, ble=ble))
+    assert _frame(proto.MSG_PING_REQUEST, b"") in bytes(conn.writer.sent)
+    assert ble.disconnect_calls == [ADDRESS]
+
+
+def test_quiet_client_that_answers_pings_stays_connected(monkeypatch):
+    # Home Assistant sends nothing while advertisements flow, but answers our
+    # pings. It must not be dropped (v1.0.3-benjagit.6 dropped it every 90 s).
+    monkeypatch.setattr(api_server, "PING_INTERVAL", 0.02)
+    monkeypatch.setattr(api_server, "CLIENT_IDLE_TIMEOUT", 0.1)
+    ble = FakeBLE()
+
+    async def scenario():
+        reader = asyncio.StreamReader()
+        reader.feed_data(
+            _frame(proto.MSG_BLE_DEVICE_REQUEST, _connect_request(ADDRESS))
+        )
+        writer = FakeWriter()
+        conn = api_server.APIConnection(reader, writer, FakeServer(ble))
+        task = asyncio.create_task(conn.run())
+        ping = _frame(proto.MSG_PING_REQUEST, b"")
+        answered = 0
+        loop = asyncio.get_running_loop()
+        end = loop.time() + 0.4  # four idle timeouts
+        while loop.time() < end:
+            await asyncio.sleep(0.005)
+            pings = bytes(writer.sent).count(ping)
+            while answered < pings:
+                reader.feed_data(_frame(proto.MSG_PING_RESPONSE, b""))
+                answered += 1
+        assert not task.done()
+        reader.feed_eof()
+        await asyncio.wait_for(task, 1.0)
+        return answered
+
+    answered = asyncio.run(scenario())
+    assert answered >= 3
+    # Dropped only at the final EOF, never for being quiet.
     assert ble.disconnect_calls == [ADDRESS]
 
 
