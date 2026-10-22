@@ -55,7 +55,7 @@ VLAN="${VLAN:-40}"
 [ "$KEEPWIFI" = 1 ] && [ "$NET" = wifi ] && { echo "KEEPWIFI=1 giver kun mening med NET=eth eller vlan"; exit 1; }
 [ "$USBWIFI" = 1 ] && [ "$DONGLE" = 1 ] && { echo "Vælg enten USBWIFI=1 eller DONGLE=1"; exit 1; }
 MAC_IF=eth0
-TAG="${TAG:-v1.0.3-benjagit.6}"
+TAG="${TAG:-v1.0.3-benjagit.7}"
 HA_IP="${HA_IP:-192.168.40.2}"
 CFG=/boot/firmware/config.txt
 REBOOT=0
