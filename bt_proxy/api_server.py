@@ -15,9 +15,13 @@ logger = logging.getLogger(__name__)
 # How often to flush batched advertisements (seconds)
 ADV_BATCH_INTERVAL = 0.1
 
-# Drop a client that has sent nothing for this long. Home Assistant pings
-# every ~20 s, so silence means the link is gone (e.g. WiFi dropped) even if
-# TCP has not noticed yet - and until we notice, its BLE links stay up.
+# Home Assistant only pings when it has heard nothing from us, and the
+# advertisement stream means it always has - so a healthy client can stay
+# silent indefinitely. Like ESPHome, we ping it after PING_INTERVAL of
+# silence and drop it after CLIENT_IDLE_TIMEOUT without any reply: a dead
+# WiFi link need not surface as a TCP error, and until we notice, its BLE
+# links stay up.
+PING_INTERVAL = 30.0
 CLIENT_IDLE_TIMEOUT = 90.0
 
 
@@ -47,6 +51,7 @@ class APIConnection:
     async def run(self) -> None:
         """Main loop: read and dispatch messages from the client."""
         logger.info("Client connected from %s", self._peer)
+        read_task: asyncio.Future[tuple[int, bytes]] | None = None
         try:
             # Peek at first byte to detect Noise vs plaintext
             first = await self.reader.readexactly(1)
@@ -80,22 +85,34 @@ class APIConnection:
             )
             await self._handle_message(msg_type, data)
 
+            # The read runs as its own task and is never cancelled mid-frame
+            # by the idle check, so the stream cannot lose sync.
+            last_rx = time.monotonic()
             while not self._closed:
-                msg_type, data = await asyncio.wait_for(
-                    self._read_message(), CLIENT_IDLE_TIMEOUT
-                )
+                if read_task is None:
+                    read_task = asyncio.ensure_future(self._read_message())
+                done, _ = await asyncio.wait({read_task}, timeout=PING_INTERVAL)
+                if not done:
+                    if time.monotonic() - last_rx >= CLIENT_IDLE_TIMEOUT:
+                        logger.warning(
+                            "Client %s silent for %.0f s, dropping it",
+                            self._peer,
+                            CLIENT_IDLE_TIMEOUT,
+                        )
+                        break
+                    self._send_message(proto.MSG_PING_REQUEST, b"")
+                    continue
+                msg_type, data = read_task.result()
+                read_task = None
+                last_rx = time.monotonic()
                 await self._handle_message(msg_type, data)
         except (asyncio.IncompleteReadError, ConnectionResetError, OSError):
             logger.info("Client %s disconnected", self._peer)
-        except asyncio.TimeoutError:
-            logger.warning(
-                "Client %s silent for %.0f s, dropping it",
-                self._peer,
-                CLIENT_IDLE_TIMEOUT,
-            )
         except Exception:
             logger.exception("Error handling client %s", self._peer)
         finally:
+            if read_task is not None:
+                read_task.cancel()
             await self._cleanup()
 
     async def _read_message(self) -> tuple[int, bytes]:
