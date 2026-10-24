@@ -34,8 +34,9 @@
 # ARM_FREQ  max CPU-frekvens i MHz (standard 900). Proxyen bruger lidt CPU; lavere
 #           frekvens holder Pi'en køligere. Strømmen falder kun ~0,06 W (målt 24/10), da
 #           den alligevel står på 600 MHz i tomgang. ARM_FREQ= (tom) = Pi'ens standard.
-# UPDATE_DAY  dag i måneden for den automatiske opdatering (bt-proxy-update, kl. 04:00).
-#           Standard er tallet i NAME (bt-proxy-2 → den 2.), så kun én proxy er nede ad gangen.
+# UPDATE_DAY  ugedag for den automatiske opdatering (bt-proxy-update, kl. 04:00), 1 = mandag
+#           til 7 = søndag. Standard er tallet i NAME (bt-proxy-2 → tirsdag), så kun én proxy
+#           er nede ad gangen, og en dårlig opdatering melder sig, før den næste kører.
 # UPDATE_WEBHOOK  HA-webhook, der får besked, når en opdatering fejler. Tom = ingen besked.
 # LOG_URL   hvor journalen sendes hen (systemd-journal-upload). Standard er VictoriaLogs
 #           i LXC 105 'logs' på nuc-pve. LOG_URL= (tom) slår det fra.
@@ -62,7 +63,8 @@ VLAN="${VLAN:-40}"
 ARM_FREQ="${ARM_FREQ-900}"
 UPDATE_DAY="${UPDATE_DAY:-$(echo "$NAME" | grep -o '[0-9]*$')}"
 UPDATE_WEBHOOK="${UPDATE_WEBHOOK-}"
-case "$UPDATE_DAY" in [1-9]|1[0-9]|2[0-8]) ;; *) echo "UPDATE_DAY skal være 1-28 (fik '$UPDATE_DAY')"; exit 1 ;; esac
+case "$UPDATE_DAY" in [1-7]) ;; *) echo "UPDATE_DAY skal være 1-7 (fik '$UPDATE_DAY')"; exit 1 ;; esac
+UPDATE_WEEKDAY=$(echo Mon Tue Wed Thu Fri Sat Sun | cut -d' ' -f"$UPDATE_DAY")
 [ "$USBWIFI" = 1 ] && [ "$NET" != wifi ] && { echo "USBWIFI=1 kræver NET=wifi"; exit 1; }
 [ "$KEEPWIFI" = 1 ] && [ "$NET" = wifi ] && { echo "KEEPWIFI=1 giver kun mening med NET=eth eller vlan"; exit 1; }
 [ "$USBWIFI" = 1 ] && [ "$DONGLE" = 1 ] && { echo "Vælg enten USBWIFI=1 eller DONGLE=1"; exit 1; }
@@ -278,7 +280,7 @@ for t in apt-daily apt-daily-upgrade man-db e2scrub_all fstrim; do
 done
 echo "remount-fs springes over under overlay; swap kun zram; apt-daily, apt-daily-upgrade, man-db, e2scrub_all og fstrim er slået fra"
 
-step "Automatisk opdatering: den $UPDATE_DAY. kl. 04:00"
+step "Automatisk opdatering: hver $UPDATE_WEEKDAY kl. 04:00"
 # Under overlay kræver en opdatering to genstarte: overlay fra, opdatér, overlay til.
 # Markøren ligger på boot-partitionen, som overlever genstarten. Den tæller forsøg, så
 # en opdatering, der hænger eller afbrydes, opgives efter to forsøg, og overlay altid
@@ -347,7 +349,7 @@ EOF
 sudo chmod 755 /usr/local/sbin/bt-proxy-update
 sudo tee /etc/systemd/system/bt-proxy-update.service >/dev/null <<'EOF'
 [Unit]
-Description=Monthly apt upgrade under overlay (turns overlay off and reboots if needed)
+Description=Weekly apt upgrade under overlay (turns overlay off and reboots if needed)
 Wants=network-online.target
 After=network-online.target
 
@@ -357,10 +359,10 @@ ExecStart=/usr/local/sbin/bt-proxy-update check
 EOF
 sudo tee /etc/systemd/system/bt-proxy-update.timer >/dev/null <<EOF
 [Unit]
-Description=Monthly bt-proxy update check
+Description=Weekly bt-proxy update check
 
 [Timer]
-OnCalendar=*-*-$(printf '%02d' "$UPDATE_DAY") 04:00:00
+OnCalendar=$UPDATE_WEEKDAY *-*-* 04:00:00
 Persistent=false
 
 [Install]
@@ -383,7 +385,7 @@ ExecStopPost=/bin/sh -c '[ "$SERVICE_RESULT" = success ] || systemctl reboot'
 [Install]
 WantedBy=multi-user.target
 EOF
-echo "bt-proxy-update.timer: den $UPDATE_DAY. kl. 04:00; besked ved fejl: ${UPDATE_WEBHOOK:-(ingen)}"
+echo "bt-proxy-update.timer: hver $UPDATE_WEEKDAY kl. 04:00; besked ved fejl: ${UPDATE_WEBHOOK:-(ingen)}"
 
 step "nftables: kun HA ($HA_IP) må nå 6053"
 sudo tee /etc/nftables.conf >/dev/null <<EOF
