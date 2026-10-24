@@ -31,6 +31,12 @@
 #           (dtoverlay=disable-bt), så dongle'en bliver hci0. Kræver genstart.
 # KEEPWIFI=1 (eth/vlan) lad den indbyggede WiFi blive tændt som reserveadgang. Den
 #           skal allerede være forbundet til Coldberg_IoT; kablet vinder på rute-metric.
+# ARM_FREQ  max CPU-frekvens i MHz (standard 900). Proxyen bruger lidt CPU; lavere
+#           frekvens holder Pi'en køligere. Strømmen falder kun ~0,06 W (målt 24/10), da
+#           den alligevel står på 600 MHz i tomgang. ARM_FREQ= (tom) = Pi'ens standard.
+# UPDATE_DAY  dag i måneden for den automatiske opdatering (bt-proxy-update, kl. 04:00).
+#           Standard er tallet i NAME (bt-proxy-2 → den 2.), så kun én proxy er nede ad gangen.
+# UPDATE_WEBHOOK  HA-webhook, der får besked, når en opdatering fejler. Tom = ingen besked.
 # LOG_URL   hvor journalen sendes hen (systemd-journal-upload). Standard er VictoriaLogs
 #           i LXC 105 'logs' på nuc-pve. LOG_URL= (tom) slår det fra.
 # OVERLAY=1 skrivebeskyttet rod (overlayfs, raspi-config) til sidst, så USB-nøglen/
@@ -42,6 +48,8 @@ if grep -q ' / overlay ' /proc/mounts; then
   echo "Roden er skrivebeskyttet (overlay): kør 'sudo bt-proxy-overlay off', genstart og prøv igen."
   exit 1
 fi
+# Overlay sætter boot-partitionen ro i fstab, og den forbliver ro, når overlay slås fra.
+sudo mount -o remount,rw /boot/firmware
 : "${NAME:?NAME mangler, f.eks. bt-proxy-2}"
 : "${FRIENDLY:?FRIENDLY mangler, f.eks. \"BT Proxy 2\"}"
 : "${NET:?NET mangler: eth, vlan eller wifi}"
@@ -51,6 +59,10 @@ KEEPWIFI="${KEEPWIFI:-0}"
 OVERLAY="${OVERLAY:-0}"
 LOG_URL="${LOG_URL-http://192.168.80.222:9428/insert/journald}"
 VLAN="${VLAN:-40}"
+ARM_FREQ="${ARM_FREQ-900}"
+UPDATE_DAY="${UPDATE_DAY:-$(echo "$NAME" | grep -o '[0-9]*$')}"
+UPDATE_WEBHOOK="${UPDATE_WEBHOOK-}"
+case "$UPDATE_DAY" in [1-9]|1[0-9]|2[0-8]) ;; *) echo "UPDATE_DAY skal være 1-28 (fik '$UPDATE_DAY')"; exit 1 ;; esac
 [ "$USBWIFI" = 1 ] && [ "$NET" != wifi ] && { echo "USBWIFI=1 kræver NET=wifi"; exit 1; }
 [ "$KEEPWIFI" = 1 ] && [ "$NET" = wifi ] && { echo "KEEPWIFI=1 giver kun mening med NET=eth eller vlan"; exit 1; }
 [ "$USBWIFI" = 1 ] && [ "$DONGLE" = 1 ] && { echo "Vælg enten USBWIFI=1 eller DONGLE=1"; exit 1; }
@@ -77,6 +89,13 @@ step "System"
 (. /etc/os-release; echo "$PRETTY_NAME / $(uname -m) / kernel $(uname -r)")
 vcgencmd get_throttled || true
 sudo hostnamectl set-hostname "$NAME" && echo "hostname: $NAME"
+CUR_FREQ=$(grep -E '^arm_freq=' "$CFG" | cut -d= -f2)
+if [ "$CUR_FREQ" != "$ARM_FREQ" ]; then
+  sudo sed -i '/^arm_freq=/d' "$CFG"
+  [ -n "$ARM_FREQ" ] && echo "arm_freq=$ARM_FREQ" | sudo tee -a "$CFG" >/dev/null
+  REBOOT=1
+fi
+echo "arm_freq: ${ARM_FREQ:-standard}"
 
 step "Netværk ($NET)"
 case "$NET" in
@@ -139,7 +158,7 @@ fi
 
 step "Pakker"
 sudo DEBIAN_FRONTEND=noninteractive apt-get update -qq
-sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq git rfkill nftables iw >/dev/null && echo "git rfkill nftables iw ok"
+sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq git rfkill nftables iw curl >/dev/null && echo "git rfkill nftables iw curl ok"
 sudo rfkill unblock bluetooth
 bluetoothctl --version
 
@@ -241,6 +260,131 @@ if [ -n "$LOG_URL" ]; then
     | sudo tee /etc/systemd/system/systemd-journal-upload.service.d/10-restart.conf >/dev/null
 fi
 
+step "Overlay-venlige systemtjenester"
+# Under overlay kan roden ikke genmonteres, så systemd-remount-fs fejler, hver gang en
+# tjeneste med standardafhængigheder starter (net-watchdog hvert minut). Fejlen trækker
+# zram-swap med ned. Med overlay slået fra kører den som normalt.
+sudo install -d /etc/systemd/system/systemd-remount-fs.service.d
+printf '[Unit]\nConditionPathIsMountPoint=!/media/root-ro\n' \
+  | sudo tee /etc/systemd/system/systemd-remount-fs.service.d/10-skip-on-overlay.conf >/dev/null
+# Kun komprimeret swap i RAM. rpi-swaps standard (zram + /var/swap) kopierer under overlay
+# swapfilen op i RAM-overlayet og fylder det.
+sudo install -d /etc/rpi/swap.conf.d
+printf '[Main]\nMechanism=zram\n' | sudo tee /etc/rpi/swap.conf.d/10-zram-only.conf >/dev/null
+sudo swapoff /var/swap 2>/dev/null; sudo rm -f /var/swap
+# Disse skriver kun til RAM under overlay og er væk ved næste genstart.
+for t in apt-daily apt-daily-upgrade man-db e2scrub_all fstrim; do
+  sudo systemctl disable --now "$t.timer" 2>/dev/null || true
+done
+echo "remount-fs springes over under overlay; swap kun zram; apt-daily, apt-daily-upgrade, man-db, e2scrub_all og fstrim er slået fra"
+
+step "Automatisk opdatering: den $UPDATE_DAY. kl. 04:00"
+# Under overlay kræver en opdatering to genstarte: overlay fra, opdatér, overlay til.
+# Markøren ligger på boot-partitionen, som overlever genstarten. Den tæller forsøg, så
+# en opdatering, der hænger eller afbrydes, opgives efter to forsøg, og overlay altid
+# slås til igen.
+printf 'WEBHOOK_URL=%s\n' "$UPDATE_WEBHOOK" | sudo tee /etc/bt-proxy-update.conf >/dev/null
+sudo tee /usr/local/sbin/bt-proxy-update >/dev/null <<'EOF'
+#!/bin/sh
+# check: under overlay, slå overlay fra og genstart, hvis der er opdateringer.
+# resume: efter genstarten, opdatér, slå overlay til og genstart.
+set -u
+MARK=/boot/firmware/bt-proxy-update.pending
+WEBHOOK_URL=""
+[ -f /etc/bt-proxy-update.conf ] && . /etc/bt-proxy-update.conf
+overlay() { grep -q ' / overlay ' /proc/mounts; }
+fail() {
+  echo "FEJL: $1"
+  [ -n "$WEBHOOK_URL" ] && curl -s -m 15 -X POST -H 'Content-Type: application/json' \
+    -d "{\"host\":\"$(hostname)\",\"result\":\"fejl\",\"detail\":\"$1\"}" "$WEBHOOK_URL" >/dev/null
+  return 0
+}
+case "${1:-}" in
+  check)
+    overlay || { echo "roden er skrivbar (manuel vedligeholdelse?); springer over"; exit 0; }
+    [ -e "$MARK" ] && { echo "markør findes allerede; springer over"; exit 0; }
+    timeout 600 apt-get update -qq || { fail "apt-get update fejlede"; exit 1; }
+    N=$(apt-get -s full-upgrade | grep -c '^Inst ')
+    [ "$N" -eq 0 ] && { echo "ingen opdateringer"; exit 0; }
+    echo "$N pakker kan opdateres; slår overlay fra og genstarter"
+    mount -o remount,rw /boot/firmware && echo 0 > "$MARK" && sync
+    mount -o remount,ro /boot/firmware 2>/dev/null
+    bt-proxy-overlay off || { fail "overlay kunne ikke slås fra"; exit 1; }
+    systemctl reboot
+    ;;
+  resume)
+    [ -e "$MARK" ] || exit 0
+    if overlay; then
+      mount -o remount,rw /boot/firmware; rm -f "$MARK"; sync
+      fail "overlay blev ikke slået fra; opdatering opgivet"; exit 1
+    fi
+    # fstab monterer boot-partitionen ro, også med overlay slået fra; kerne-,
+    # firmware- og initramfs-opdateringer skriver dertil.
+    mount -o remount,rw /boot/firmware
+    A=$(( $(cat "$MARK" 2>/dev/null || echo 0) + 1 )); echo "$A" > "$MARK"; sync
+    if [ "$A" -gt 2 ]; then
+      fail "opdatering opgivet efter 2 afbrudte forsøg"
+    else
+      export DEBIAN_FRONTEND=noninteractive
+      OPTS="-y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold"
+      # shellcheck disable=SC2086
+      if timeout 600 dpkg --configure -a && timeout 600 apt-get update -qq \
+        && timeout 3600 apt-get $OPTS full-upgrade; then
+        # shellcheck disable=SC2086
+        apt-get $OPTS autoremove; apt-get clean
+        echo "opdatering ok"
+      else
+        fail "apt full-upgrade fejlede (forsøg $A)"
+      fi
+    fi
+    rm -f "$MARK"; sync
+    bt-proxy-overlay on
+    systemctl reboot
+    ;;
+  *) echo "brug: bt-proxy-update check|resume"; exit 2 ;;
+esac
+EOF
+sudo chmod 755 /usr/local/sbin/bt-proxy-update
+sudo tee /etc/systemd/system/bt-proxy-update.service >/dev/null <<'EOF'
+[Unit]
+Description=Monthly apt upgrade under overlay (turns overlay off and reboots if needed)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/bt-proxy-update check
+EOF
+sudo tee /etc/systemd/system/bt-proxy-update.timer >/dev/null <<EOF
+[Unit]
+Description=Monthly bt-proxy update check
+
+[Timer]
+OnCalendar=*-*-$(printf '%02d' "$UPDATE_DAY") 04:00:00
+Persistent=false
+
+[Install]
+WantedBy=timers.target
+EOF
+sudo tee /etc/systemd/system/bt-proxy-update-resume.service >/dev/null <<'EOF'
+[Unit]
+Description=Finish a pending bt-proxy update after the reboot
+ConditionPathExists=/boot/firmware/bt-proxy-update.pending
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+TimeoutStartSec=90min
+ExecStart=/usr/local/sbin/bt-proxy-update resume
+# Dræbt eller fejlet: genstart, så næste forsøg (eller opgivelsen) slår overlay til igen.
+ExecStopPost=/bin/sh -c '[ "$SERVICE_RESULT" = success ] || systemctl reboot'
+
+[Install]
+WantedBy=multi-user.target
+EOF
+echo "bt-proxy-update.timer: den $UPDATE_DAY. kl. 04:00; besked ved fejl: ${UPDATE_WEBHOOK:-(ingen)}"
+
 step "nftables: kun HA ($HA_IP) må nå 6053"
 sudo tee /etc/nftables.conf >/dev/null <<EOF
 #!/usr/sbin/nft -f
@@ -256,7 +400,8 @@ EOF
 step "Start"
 sudo systemctl daemon-reload
 sudo systemctl restart systemd-journald bluetooth
-UNITS="nftables bt-proxy bt-proxy-watchdog.timer net-watchdog.timer"
+UNITS="nftables bt-proxy bt-proxy-watchdog.timer net-watchdog.timer bt-proxy-update.timer"
+sudo systemctl enable bt-proxy-update-resume.service 2>&1 | grep -v '^Created symlink' || true
 [ -n "$LOG_URL" ] && UNITS="$UNITS systemd-journal-upload"
 # shellcheck disable=SC2086
 sudo systemctl enable --now $UNITS 2>&1 | grep -v '^Created symlink' || true
