@@ -38,8 +38,17 @@
 #           til 7 = søndag. Standard er tallet i NAME (bt-proxy-2 → tirsdag), så kun én proxy
 #           er nede ad gangen, og en dårlig opdatering melder sig, før den næste kører.
 # UPDATE_WEBHOOK  HA-webhook, der får besked, når en opdatering fejler. Tom = ingen besked.
-# LOG_URL   hvor journalen sendes hen (systemd-journal-upload). Standard er VictoriaLogs
-#           i LXC 105 'logs' på nuc-pve. LOG_URL= (tom) slår det fra.
+# LOG_URL   hvor journalen sendes hen (systemd-journal-upload, som selv lægger /upload til).
+#           Standard er observability-hubbens vmauth (bruger LOG_USER, standard 'home').
+#           Porten skal stå i URL'en: uden ':' i værtsdelen sætter journal-upload :19532
+#           på. LOG_URL= (tom) slår det fra.
+# LOG_PASSWORD  adgangskoden til LOG_URL (basic auth). Kommer aldrig i git; giv den med
+#           ved kørslen, f.eks. hentet på desktoppen med
+#           op read 'op://Private/Observability hub/INGEST_PASSWORD_HOME'.
+#           Den lægges i URL'en i /etc/systemd/journal-upload.conf.d/10-upload.conf
+#           (640 root:systemd-journal-upload). Tom = behold den, der allerede ligger der.
+#           NB: journal-upload skriver hele URL'en, inkl. adgangskoden, i journalen, når
+#           en upload fejler, og de linjer sendes med til hubben, når den svarer igen.
 # OVERLAY=1 skrivebeskyttet rod (overlayfs, raspi-config) til sidst, så USB-nøglen/
 #           SD-kortet ikke slides. Alt skrevet efter genstarten ligger i RAM. Opdatering:
 #           'sudo bt-proxy-overlay off' + genstart, opdatér, 'sudo bt-proxy-overlay on' +
@@ -58,7 +67,9 @@ DONGLE="${DONGLE:-0}"
 USBWIFI="${USBWIFI:-0}"
 KEEPWIFI="${KEEPWIFI:-0}"
 OVERLAY="${OVERLAY:-0}"
-LOG_URL="${LOG_URL-http://192.168.80.222:9428/insert/journald}"
+LOG_URL="${LOG_URL-https://obs-ingest.coldberg.dk:443/insert/journald}"
+LOG_USER="${LOG_USER:-home}"
+LOG_PASSWORD="${LOG_PASSWORD-}"
 VLAN="${VLAN:-40}"
 ARM_FREQ="${ARM_FREQ-900}"
 UPDATE_DAY="${UPDATE_DAY:-$(echo "$NAME" | grep -o '[0-9]*$')}"
@@ -257,7 +268,31 @@ if [ -n "$LOG_URL" ]; then
   # Kun uploaderen; modtageren skal ikke køre her.
   sudo systemctl disable --now systemd-journal-remote.socket systemd-journal-remote.service 2>/dev/null || true
   sudo install -d /etc/systemd/journal-upload.conf.d /etc/systemd/system/systemd-journal-upload.service.d
-  printf '[Upload]\nURL=%s\n' "$LOG_URL" | sudo tee /etc/systemd/journal-upload.conf.d/10-victorialogs.conf >/dev/null
+  # Enheden har DynamicUser=yes, men bruger en statisk bruger, hvis den findes. Så kan
+  # filen med adgangskoden ejes af dens gruppe og være lukket for alle andre.
+  printf 'u systemd-journal-upload - "systemd Journal Upload" /nonexistent /usr/sbin/nologin\n' \
+    | sudo tee /etc/sysusers.d/bt-proxy-journal-upload.conf >/dev/null
+  sudo systemd-sysusers /etc/sysusers.d/bt-proxy-journal-upload.conf
+  sudo rm -f /etc/systemd/journal-upload.conf.d/10-victorialogs.conf
+  # Ved https vil journal-upload ellers have et klientcertifikat (/etc/ssl/certs/
+  # journal-upload.pem) og stole på /etc/ssl/ca/trusted.pem. '-' slår klientcert fra.
+  printf '[Upload]\nServerKeyFile=-\nServerCertificateFile=-\nTrustedCertificateFile=/etc/ssl/certs/ca-certificates.crt\n' \
+    | sudo tee /etc/systemd/journal-upload.conf.d/20-tls.conf >/dev/null
+  LOG_CONF=/etc/systemd/journal-upload.conf.d/10-upload.conf
+  if [ -n "$LOG_PASSWORD" ]; then
+    # Via stdin, så adgangskoden aldrig står på en kommandolinje (ps).
+    LOG_PW_ENC=$(printf %s "$LOG_PASSWORD" | python3 -c 'import sys,urllib.parse; print(urllib.parse.quote(sys.stdin.read(), safe=""))')
+    printf '[Upload]\nURL=%s://%s:%s@%s\n' "${LOG_URL%%://*}" "$LOG_USER" "$LOG_PW_ENC" "${LOG_URL#*://}" \
+      | sudo install -m 640 -o root -g systemd-journal-upload /dev/stdin "$LOG_CONF"
+    unset LOG_PW_ENC
+    echo "adgangskode til $LOG_USER lagt i $LOG_CONF"
+  elif sudo grep -q "^URL=.*@${LOG_URL#*://}\$" "$LOG_CONF" 2>/dev/null; then
+    echo "LOG_PASSWORD ikke givet: beholder adgangskoden i $LOG_CONF"
+  else
+    printf '[Upload]\nURL=%s\n' "$LOG_URL" \
+      | sudo install -m 640 -o root -g systemd-journal-upload /dev/stdin "$LOG_CONF"
+    echo "ADVARSEL: ingen LOG_PASSWORD; journalen sendes uden login til $LOG_URL"
+  fi
   printf '[Unit]\nStartLimitIntervalSec=0\n[Service]\nRestart=always\nRestartSec=30\n' \
     | sudo tee /etc/systemd/system/systemd-journal-upload.service.d/10-restart.conf >/dev/null
 fi
