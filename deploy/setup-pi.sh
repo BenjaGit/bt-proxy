@@ -346,7 +346,11 @@ class Handler(BaseHTTPRequestHandler):
                 yield data
 
     def do_POST(self):
-        path = UPSTREAM.path.rstrip("/") + self.path
+        # Kun journal-uploads eget endpoint; alt andet afvises uden at røre hubben.
+        if self.path != "/upload":
+            self.send_error(404)
+            return
+        path = UPSTREAM.path.rstrip("/") + "/upload"
         try:
             conn = http.client.HTTPSConnection(UPSTREAM.hostname, UPSTREAM.port or 443,
                                                context=CTX, timeout=120)
