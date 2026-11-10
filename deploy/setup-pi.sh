@@ -38,17 +38,15 @@
 #           til 7 = søndag. Standard er tallet i NAME (bt-proxy-2 → tirsdag), så kun én proxy
 #           er nede ad gangen, og en dårlig opdatering melder sig, før den næste kører.
 # UPDATE_WEBHOOK  HA-webhook, der får besked, når en opdatering fejler. Tom = ingen besked.
-# LOG_URL   hvor journalen sendes hen (systemd-journal-upload, som selv lægger /upload til).
-#           Standard er observability-hubbens vmauth (bruger LOG_USER, standard 'home').
-#           Porten skal stå i URL'en: uden ':' i værtsdelen sætter journal-upload :19532
-#           på. LOG_URL= (tom) slår det fra.
+# LOG_URL   hvor journalen sendes hen. Standard er observability-hubbens vmauth (bruger
+#           LOG_USER, standard 'home'). journal-upload sender til en lokal videresender
+#           (bt-proxy-journal-forward på 127.0.0.1:19533), som sætter login på og sender
+#           videre over HTTP/1.1. LOG_URL= (tom) slår det fra.
 # LOG_PASSWORD  adgangskoden til LOG_URL (basic auth). Kommer aldrig i git; giv den med
 #           ved kørslen, f.eks. hentet på desktoppen med
 #           op read 'op://Private/Observability hub/INGEST_PASSWORD_HOME'.
-#           Den lægges i URL'en i /etc/systemd/journal-upload.conf.d/10-upload.conf
-#           (640 root:systemd-journal-upload). Tom = behold den, der allerede ligger der.
-#           NB: journal-upload skriver hele URL'en, inkl. adgangskoden, i journalen, når
-#           en upload fejler, og de linjer sendes med til hubben, når den svarer igen.
+#           Lægges i /etc/bt-proxy/journal-auth (600 root) og gives til videresenderen som
+#           systemd-credential. Tom = behold den, der allerede ligger der.
 # OVERLAY=1 skrivebeskyttet rod (overlayfs, raspi-config) til sidst, så USB-nøglen/
 #           SD-kortet ikke slides. Alt skrevet efter genstarten ligger i RAM. Opdatering:
 #           'sudo bt-proxy-overlay off' + genstart, opdatér, 'sudo bt-proxy-overlay on' +
@@ -268,31 +266,151 @@ if [ -n "$LOG_URL" ]; then
   # Kun uploaderen; modtageren skal ikke køre her.
   sudo systemctl disable --now systemd-journal-remote.socket systemd-journal-remote.service 2>/dev/null || true
   sudo install -d /etc/systemd/journal-upload.conf.d /etc/systemd/system/systemd-journal-upload.service.d
-  # Enheden har DynamicUser=yes, men bruger en statisk bruger, hvis den findes. Så kan
-  # filen med adgangskoden ejes af dens gruppe og være lukket for alle andre.
-  printf 'u systemd-journal-upload - "systemd Journal Upload" /nonexistent /usr/sbin/nologin\n' \
-    | sudo tee /etc/sysusers.d/bt-proxy-journal-upload.conf >/dev/null
-  sudo systemd-sysusers /etc/sysusers.d/bt-proxy-journal-upload.conf
-  sudo rm -f /etc/systemd/journal-upload.conf.d/10-victorialogs.conf
-  # Ved https vil journal-upload ellers have et klientcertifikat (/etc/ssl/certs/
-  # journal-upload.pem) og stole på /etc/ssl/ca/trusted.pem. '-' slår klientcert fra.
-  printf '[Upload]\nServerKeyFile=-\nServerCertificateFile=-\nTrustedCertificateFile=/etc/ssl/certs/ca-certificates.crt\n' \
-    | sudo tee /etc/systemd/journal-upload.conf.d/20-tls.conf >/dev/null
-  LOG_CONF=/etc/systemd/journal-upload.conf.d/10-upload.conf
+  # Rester fra tidligere opsætninger (login i URL'en, https direkte fra journal-upload).
+  sudo rm -f /etc/systemd/journal-upload.conf.d/10-victorialogs.conf \
+    /etc/systemd/journal-upload.conf.d/20-tls.conf /etc/sysusers.d/bt-proxy-journal-upload.conf
+  # Videresenderen: journal-upload kan kun give login i URL'en (og skriver den i journalen
+  # ved fejl), og over HTTP/2 afbryder den med "Buffer space is too small to write entry".
+  sudo tee /usr/local/sbin/bt-proxy-journal-forward >/dev/null <<'EOF'
+#!/usr/bin/python3 -I
+# Lokal videresender: systemd-journal-upload -> observability-hubben.
+# - journal-upload kan kun give login som bruger:kode i URL'en og skriver URL'en i
+#   journalen, når en upload fejler. Her kommer login fra en systemd-credential.
+# - journal-upload (systemd 257) afbryder over HTTP/2, når curl giver en buffer, der er
+#   mindre end næste posts første linje ("Buffer space is too small to write entry").
+#   Her taler begge led HTTP/1.1.
+# - Adgangskoden maskeres med '*' i samme længde, hvis den står i selve journalen.
+import base64
+import http.client
+import os
+import ssl
+import sys
+import urllib.parse
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+UPSTREAM = urllib.parse.urlsplit(os.environ["UPSTREAM"])
+LISTEN = int(os.environ.get("LISTEN_PORT", "19533"))
+with open(os.path.join(os.environ["CREDENTIALS_DIRECTORY"], "auth"), "rb") as f:
+    CRED = f.read().strip()  # bruger:kode
+AUTH = "Basic " + base64.b64encode(CRED).decode()
+PW = CRED.split(b":", 1)[1]
+SECRETS = sorted({PW, urllib.parse.quote(PW, safe="").encode(), AUTH.split()[1].encode()},
+                 key=len, reverse=True)
+KEEP = max(len(s) for s in SECRETS) - 1
+CTX = ssl.create_default_context()
+
+
+def redact(chunks):
+    tail = b""
+    for chunk in chunks:
+        data = tail + chunk
+        for s in SECRETS:
+            data = data.replace(s, b"*" * len(s))
+        if len(data) <= KEEP:
+            tail = data
+            continue
+        out, tail = data[:len(data) - KEEP], data[len(data) - KEEP:]
+        yield out
+    if tail:
+        yield tail
+
+
+class Handler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, fmt, *args):
+        # Kun fejl logges (log_error); en linje pr. upload ville selv blive uploadet.
+        pass
+
+    def log_error(self, fmt, *args):
+        print(fmt % args, file=sys.stderr, flush=True)
+
+    def body(self):
+        if self.headers.get("Transfer-Encoding", "").lower() == "chunked":
+            while True:
+                size = int(self.rfile.readline().split(b";")[0].strip(), 16)
+                if size == 0:
+                    while self.rfile.readline() not in (b"\r\n", b"\n", b""):
+                        pass
+                    return
+                data = self.rfile.read(size)
+                self.rfile.readline()
+                yield data
+        else:
+            left = int(self.headers.get("Content-Length", "0"))
+            while left > 0:
+                data = self.rfile.read(min(left, 65536))
+                if not data:
+                    return
+                left -= len(data)
+                yield data
+
+    def do_POST(self):
+        path = UPSTREAM.path.rstrip("/") + self.path
+        try:
+            conn = http.client.HTTPSConnection(UPSTREAM.hostname, UPSTREAM.port or 443,
+                                               context=CTX, timeout=120)
+            conn.request("POST", path, body=redact(self.body()), encode_chunked=True, headers={
+                "Authorization": AUTH,
+                "Content-Type": self.headers.get("Content-Type", "application/vnd.fdo.journal"),
+                "Accept": "text/plain",
+                "Transfer-Encoding": "chunked",
+                "User-Agent": "bt-proxy-journal-forward (" + self.headers.get("User-Agent", "") + ")",
+            })
+            resp = conn.getresponse()
+            status, answer = resp.status, resp.read()
+            conn.close()
+        except Exception as e:  # noqa: BLE001 - journal-upload prøver selv igen
+            self.log_error("upstream %s: %s", UPSTREAM.hostname, e)
+            status, answer = 502, b"upstream error\n"
+        if status >= 300:
+            self.log_error("upstream svarede %d: %s", status, answer[:200].decode(errors="replace"))
+        self.send_response(status)
+        self.send_header("Content-Type", "text/plain")
+        self.send_header("Content-Length", str(len(answer)))
+        self.end_headers()
+        self.wfile.write(answer)
+
+
+ThreadingHTTPServer(("127.0.0.1", LISTEN), Handler).serve_forever()
+EOF
+  sudo chmod 755 /usr/local/sbin/bt-proxy-journal-forward
+  sudo install -d -m 700 /etc/bt-proxy
   if [ -n "$LOG_PASSWORD" ]; then
     # Via stdin, så adgangskoden aldrig står på en kommandolinje (ps).
-    LOG_PW_ENC=$(printf %s "$LOG_PASSWORD" | python3 -c 'import sys,urllib.parse; print(urllib.parse.quote(sys.stdin.read(), safe=""))')
-    printf '[Upload]\nURL=%s://%s:%s@%s\n' "${LOG_URL%%://*}" "$LOG_USER" "$LOG_PW_ENC" "${LOG_URL#*://}" \
-      | sudo install -m 640 -o root -g systemd-journal-upload /dev/stdin "$LOG_CONF"
-    unset LOG_PW_ENC
-    echo "adgangskode til $LOG_USER lagt i $LOG_CONF"
-  elif sudo grep -q "^URL=.*@${LOG_URL#*://}\$" "$LOG_CONF" 2>/dev/null; then
-    echo "LOG_PASSWORD ikke givet: beholder adgangskoden i $LOG_CONF"
+    printf '%s:%s' "$LOG_USER" "$LOG_PASSWORD" | sudo install -m 600 /dev/stdin /etc/bt-proxy/journal-auth
+    echo "login til $LOG_USER lagt i /etc/bt-proxy/journal-auth"
+  elif sudo test -s /etc/bt-proxy/journal-auth; then
+    echo "LOG_PASSWORD ikke givet: beholder /etc/bt-proxy/journal-auth"
   else
-    printf '[Upload]\nURL=%s\n' "$LOG_URL" \
-      | sudo install -m 640 -o root -g systemd-journal-upload /dev/stdin "$LOG_CONF"
-    echo "ADVARSEL: ingen LOG_PASSWORD; journalen sendes uden login til $LOG_URL"
+    echo "ADVARSEL: ingen LOG_PASSWORD og ingen /etc/bt-proxy/journal-auth; journalen sendes ikke"
   fi
+  sudo tee /etc/systemd/system/bt-proxy-journal-forward.service >/dev/null <<EOF
+[Unit]
+Description=Videresender journalen til $LOG_URL
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Environment=UPSTREAM=$LOG_URL LISTEN_PORT=19533
+ExecStart=/usr/local/sbin/bt-proxy-journal-forward
+# Færdig først, når porten lytter, så journal-upload (After=) ikke kommer for tidligt.
+ExecStartPost=/usr/bin/timeout 15 sh -c 'until ss -Hltn "sport = :19533" | grep -q .; do sleep 0.2; done'
+LoadCredential=auth:/etc/bt-proxy/journal-auth
+DynamicUser=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+NoNewPrivileges=yes
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  printf '[Upload]\nURL=http://127.0.0.1:19533\n' | sudo tee /etc/systemd/journal-upload.conf.d/10-upload.conf >/dev/null
+  printf '[Unit]\nWants=bt-proxy-journal-forward.service\nAfter=bt-proxy-journal-forward.service\n' \
+    | sudo tee /etc/systemd/system/systemd-journal-upload.service.d/20-forward.conf >/dev/null
   printf '[Unit]\nStartLimitIntervalSec=0\n[Service]\nRestart=always\nRestartSec=30\n' \
     | sudo tee /etc/systemd/system/systemd-journal-upload.service.d/10-restart.conf >/dev/null
 fi
@@ -439,10 +557,10 @@ sudo systemctl daemon-reload
 sudo systemctl restart systemd-journald bluetooth
 UNITS="nftables bt-proxy bt-proxy-watchdog.timer net-watchdog.timer bt-proxy-update.timer"
 sudo systemctl enable bt-proxy-update-resume.service 2>&1 | grep -v '^Created symlink' || true
-[ -n "$LOG_URL" ] && UNITS="$UNITS systemd-journal-upload"
+[ -n "$LOG_URL" ] && UNITS="$UNITS bt-proxy-journal-forward systemd-journal-upload"
 # shellcheck disable=SC2086
 sudo systemctl enable --now $UNITS 2>&1 | grep -v '^Created symlink' || true
-[ -n "$LOG_URL" ] && sudo systemctl restart systemd-journal-upload
+[ -n "$LOG_URL" ] && sudo systemctl restart bt-proxy-journal-forward systemd-journal-upload
 sleep 15
 # shellcheck disable=SC2086
 systemctl is-active bluetooth $UNITS
