@@ -81,7 +81,7 @@ UPDATE_WEEKDAY=$(echo Mon Tue Wed Thu Fri Sat Sun | cut -d' ' -f"$UPDATE_DAY")
 [ "$USBWIFI" = 1 ] && [ "$DONGLE" = 1 ] && { echo "Vælg enten USBWIFI=1 eller DONGLE=1"; exit 1; }
 MAC_IF=eth0
 TAG="${TAG:-v1.0.3-benjagit.7}"
-HA_IP="${HA_IP:-192.168.40.2}"
+HA_IP="${HA_IP:-192.168.80.40}"
 CFG=/boot/firmware/config.txt
 REBOOT=0
 UNTAGGED_CON=""
