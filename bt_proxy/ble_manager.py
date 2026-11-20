@@ -77,6 +77,15 @@ CONNECT_FAIL_BACKOFF_MAX = 60.0
 # and log how to recover rather than flapping every reconnect.
 DAEMON_WEDGE_BACKOFF = 120.0
 
+# A link nobody talks to is closed after this long. Home Assistant drops a
+# connect it has given up on (cancelled on its side) without sending a
+# disconnect, so the link the proxy still brings up would otherwise stay up for
+# good: the peripheral stops advertising and the slot is never freed. Links
+# with a notification subscription are left alone - silence is normal there.
+IDLE_DISCONNECT_TIMEOUT = 60.0
+IDLE_CHECK_INTERVAL = 5.0
+IDLE_DISCONNECT_WAIT = 10.0
+
 # Scanner start can fail transiently — most commonly BlueZ "InProgress" when a
 # previous discovery session hasn't been fully torn down yet. We make a few
 # gentle attempts, releasing the stale session between them, rather than either
@@ -168,6 +177,16 @@ class BLEConnection:
         self._on_notify = on_notify
         self._notify_handles: set[int] = set()
         self._dropped_while_connecting: asyncio.Event | None = None
+        # Last time the client used this link (connect, GATT request, notify).
+        self.last_activity = time.monotonic()
+
+    def touch(self) -> None:
+        self.last_activity = time.monotonic()
+
+    @property
+    def listening(self) -> bool:
+        """True while the client holds a notification subscription."""
+        return bool(self._notify_handles)
 
     @property
     def connected(self) -> bool:
@@ -244,6 +263,7 @@ class BLEConnection:
                 f"phantom connection to {self.mac}: BlueZ reported success "
                 f"but the device is not connected"
             )
+        self.touch()
         logger.info("Connected to %s (MTU=%d)", self.mac, self.mtu_size)
 
     async def _acquire_mtu(self) -> None:
@@ -448,8 +468,12 @@ class BLEManager:
         max_connections: int = 3,
         adapter: str | None = None,
         pause_scan_on_connect: bool = False,
+        idle_timeout: float = IDLE_DISCONNECT_TIMEOUT,
     ):
         self.max_connections = max_connections
+        # Seconds a link may sit unused before it is closed; 0 turns it off.
+        self._idle_timeout = idle_timeout
+        self._idle_task: asyncio.Task | None = None
         self._adapter = adapter
         # Experiment (off by default): stop the scanner while a connect is in
         # flight. On a single-radio controller active scanning resumes the
@@ -830,6 +854,9 @@ class BLEManager:
 
     def _handle_notify(self, address: int, handle: int, data: bytes) -> None:
         """Internal notification handler."""
+        conn = self._connections.get(address)
+        if conn:
+            conn.touch()
         if self._notify_callback:
             self._notify_callback(address, handle, data)
 
@@ -942,6 +969,7 @@ class BLEManager:
                     # Success clears any backoff and the wedge latch.
                     self._connect_backoff.pop(address, None)
                     self._daemon_wedge_logged = False
+                    self._ensure_idle_watchdog()
                     return True, conn.mtu_size, 0
                 except Exception as e:
                     last_error = e
@@ -1026,17 +1054,62 @@ class BLEManager:
             await self._bluez_clear_state(conn.mac)
 
     def get_connection(self, address: int) -> BLEConnection | None:
-        """Get an active connection by address."""
+        """Get an active connection by address (counts as the client using it)."""
         conn = self._connections.get(address)
         if conn and conn.connected:
+            conn.touch()
             return conn
         return None
+
+    def _ensure_idle_watchdog(self) -> None:
+        if self._idle_timeout <= 0:
+            return
+        if self._idle_task is None or self._idle_task.done():
+            self._idle_task = asyncio.ensure_future(self._idle_watchdog_loop())
+
+    async def _idle_watchdog_loop(self) -> None:
+        """Close unused links for as long as any link is tracked."""
+        while self._connections:
+            await asyncio.sleep(IDLE_CHECK_INTERVAL)
+            try:
+                await self._close_idle_connections()
+            except Exception:  # noqa: BLE001 - the watchdog must keep running
+                logger.exception("Idle check failed")
+
+    async def _close_idle_connections(self) -> None:
+        now = time.monotonic()
+        for address, conn in list(self._connections.items()):
+            if address in self._connecting or conn.listening:
+                continue
+            idle = now - conn.last_activity
+            if idle < self._idle_timeout:
+                continue
+            logger.warning(
+                "Closing %s: connected but unused for %.0f s "
+                "(the client never used or released it)",
+                conn.mac,
+                idle,
+            )
+            try:
+                await asyncio.wait_for(conn.disconnect(), IDLE_DISCONNECT_WAIT)
+            except Exception as e:  # noqa: BLE001 - BlueZ cleanup follows anyway
+                logger.warning("Disconnect of idle %s failed: %s", conn.mac, e)
+            await self._bluez_clear_state(conn.mac)
+            # BlueZ normally reports the disconnect, which untracks the link
+            # and tells the client. Do both here if that report never came.
+            if self._connections.get(address) is conn:
+                del self._connections[address]
+                if self._disconnect_callback:
+                    self._disconnect_callback(address)
 
     async def cleanup(self) -> None:
         """Clean up all connections and stop scanning."""
         if self._scan_rearm_task is not None:
             self._scan_rearm_task.cancel()
             self._scan_rearm_task = None
+        if self._idle_task is not None:
+            self._idle_task.cancel()
+            self._idle_task = None
         for conn in list(self._connections.values()):
             try:
                 await conn.disconnect()

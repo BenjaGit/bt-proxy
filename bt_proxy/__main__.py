@@ -15,7 +15,7 @@ from zeroconf.asyncio import AsyncServiceInfo, AsyncZeroconf
 
 from . import EMULATED_ESPHOME_VERSION
 from .api_server import APIServer
-from .ble_manager import BLEManager
+from .ble_manager import IDLE_DISCONNECT_TIMEOUT, BLEManager
 
 logger = logging.getLogger(__name__)
 
@@ -138,6 +138,7 @@ async def async_main(args: argparse.Namespace) -> None:
         max_connections=args.max_connections,
         adapter=args.adapter,
         pause_scan_on_connect=args.pause_scan_on_connect,
+        idle_timeout=args.idle_timeout,
     )
     if args.pause_scan_on_connect:
         logger.info("Experiment: the BLE scanner is paused while connecting")
@@ -217,6 +218,17 @@ def main() -> None:
         default=os.environ.get("BT_PROXY_PAUSE_SCAN_ON_CONNECT", "") == "1",
         help="Experiment: stop the BLE scanner while a connect is in flight "
         "(also BT_PROXY_PAUSE_SCAN_ON_CONNECT=1)",
+    )
+    parser.add_argument(
+        "--idle-timeout",
+        type=float,
+        default=float(
+            os.environ.get("BT_PROXY_IDLE_TIMEOUT", IDLE_DISCONNECT_TIMEOUT)
+        ),
+        help="Close a BLE link the client has not used for this many seconds "
+        f"(default: {IDLE_DISCONNECT_TIMEOUT:.0f}, 0 = never; also "
+        "BT_PROXY_IDLE_TIMEOUT). Links with a notification subscription "
+        "are kept.",
     )
     parser.add_argument(
         "--log-level",
