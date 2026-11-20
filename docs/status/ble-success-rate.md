@@ -31,7 +31,28 @@ nyt forsøg med det samme, når linket tabes under opkobling.
 
 Før-tal fra danfoss-eco-ha, 40 min før kl. 21:40 (forsøg / ok / tabt / timeout / not found):
 bt-proxy-1 197 / 62 / 60 / 56 / 16, bt-proxy-2 180 / 66 / 43 / 49 / 18, bt-proxy-3 135 / 34 / 44 /
-22 / 31. Efter-tal og deploy-tidspunkt: se nederst i dette afsnit, når de er målt.
+22 / 31.
+
+Deployet 20/11 kl. 21:48:22 (bt-proxy-1), 21:48:48 (-2) og 21:49:12 (-3). Målt fra hubben
+21:50–22:20, talt pr. anmodning ("Connected to" + "Failed to connect to"), fordi "Connecting to" nu
+logges pr. forsøg:
+
+| Pi | Anmodninger | Ok | Tabt link | Timeout 30 s | Not found | Ok-andel | Før |
+|---|---|---|---|---|---|---|---|
+| bt-proxy-1 | 97 | 54 | 8 | 16 | 19 | 56 % | 31 % |
+| bt-proxy-2 | 97 | 59 | 10 | 12 | 16 | 61 % | 37 % |
+| bt-proxy-3 | 86 | 32 | 6 | 10 | 38 | 37 % | 25 % |
+
+- Vellykkede pr. minut steg mindre end andelen (bt-proxy-1 1,55 → 1,8, -2 1,65 → 1,97, -3 0,85 →
+  1,07), fordi hver anmodning nu tager længere tid, og der derfor er færre af dem.
+- Linket blev tabt 44, 51 og 42 gange, men kun 8, 10 og 6 anmodninger endte med det: resten blev
+  reddet af et nyt forsøg i samme anmodning.
+- "Not found" er nu den største fejl på bt-proxy-3 (38 af 54 fejl, næsten alle efter ét forsøg).
+  Det er anmodninger om en termostat, BlueZ på den Pi ikke kender i øjeblikket. Ikke undersøgt.
+- Sammenligningen er ikke ren: før-vinduet er 40 min og talt af danfoss-eco-ha, danfoss_eco skiftede
+  version imellem, og bt-proxy-3 blev drejet kl. 21:05.
+- Lukningen af ubrugte links (`.9`) ses nu i drift: 4 gange på bt-proxy-1 og 1 på bt-proxy-3 i
+  vinduet. HA efterlader altså stadig links uden at lukke dem.
 
 ## Forsøg i drift fra 20/11-2026 kl. 15:46
 

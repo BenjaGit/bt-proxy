@@ -4,9 +4,9 @@ Bestilt af danfoss-eco-ha 20/11-2026.
 
 ## Næste skridt
 
-1. Se i journalen efter `Closing … connected but unused for 60 s`. Hver linje er en forbindelse, HA
-   har efterladt. Ingen set endnu (kl. 20:51); rettelsen er altså testet i `tests/`, men ikke set
-   virke i drift.
+1. Lukningen virker i drift: 20/11 kl. 21:50–22:20 lukkede proxyen 4 ubrugte links på bt-proxy-1
+   og 1 på bt-proxy-3 (`Closing … connected but unused`). HA efterlader altså stadig links; find
+   ud af hvorfor på HA-siden.
 2. Kontor 2 (`…95:76:85`) bliver forsøgt igen fra 20:45, men havde ikke fået en vellykket
    forbindelse kl. 20:51 (timeout og tabt link, som ved de øvrige mislykkede forsøg). Tjek at den
    kommer igennem.
