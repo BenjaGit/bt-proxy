@@ -10,9 +10,10 @@ Bestilt af danfoss-eco-ha 20/11-2026.
 2. Kontor 2 (`…95:76:85`) bliver forsøgt igen fra 20:45, men havde ikke fået en vellykket
    forbindelse kl. 20:51 (timeout og tabt link, som ved de øvrige mislykkede forsøg). Tjek at den
    kommer igennem.
-3. `.9` ligger kun i RAM på Pi'erne (overlay). En genstart af en Pi ruller den tilbage til `.7`, og
-   så er fejlen der igen. Gør den permanent: sæt `TAG=v1.0.3-benjagit.9` som standard i
-   `deploy/setup-pi.sh` og kør den uden om overlayet. Ikke gjort.
+3. `v1.0.3-benjagit.11` er permanent på alle tre Pi'er fra 20/11 kl. 22:55: tagget er tjekket ud
+   i det nedre, skrivebeskyttede lag (`/media/root-ro/opt/bt-proxy`, genmonteret rw og tilbage til
+   ro), uden genstart. `deploy/setup-pi.sh` har `.11` som standard-tag. Ikke afprøvet med en
+   genstart af en Pi endnu.
 4. danfoss-eco-ha ser efter, om HA-siden undlader at sende disconnect ved annullering.
 
 ## I drift

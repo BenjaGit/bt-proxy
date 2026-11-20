@@ -86,6 +86,10 @@ forsøget stadig kører, før tallene bruges.
 | bt-proxy-2 (gildesal) | 2: forbindelsesinterval 7,5–15 ms, supervision timeout 2 s | 15:45:59 | `/etc/bluetooth/main.conf` under `[LE]`: `MinConnectionInterval=6`, `MaxConnectionInterval=12`, `ConnectionSupervisionTimeout=200`; bluetooth og bt-proxy genstartet. Kernen viser 6/12/200 (før 24/40/42) | `/etc/bluetooth/main.conf.bak-20261120-forsoeg` |
 | bt-proxy-3 (stue) | 4: scanneren stoppes under connect | 15:46:26 | `/opt/bt-proxy` på tag `v1.0.3-benjagit.8` (før `.7`, ingen `uv sync`, så afhængighederne er uændrede); ny fil `/etc/systemd/system/bt-proxy.service.d/10-pause-scan.conf` med `Environment=BT_PROXY_PAUSE_SCAN_ON_CONNECT=1`; bt-proxy genstartet | ingen fil ændret; `.7` er stadig i git |
 
+**Fra 20/11 kl. 22:55 er `v1.0.3-benjagit.11` permanent på alle tre** (nedre lag, se
+`haengende-forbindelser.md`). De tre forsøg er stadig kun i RAM: efter en genstart kører en Pi `.11`
+uden sit forsøg (bt-proxy-1 `Cache = yes`, bt-proxy-2 standardinterval, bt-proxy-3 uden scan-pause).
+
 `v1.0.3-benjagit.8` (commit b10ca44, pushet til BenjaGit) tilføjer kun flaget
 `--pause-scan-on-connect` / `BT_PROXY_PAUSE_SCAN_ON_CONNECT=1`. Uden flaget opfører den sig
 som `.7`. bt-proxy-1 og -2 kører stadig `.7`, og setup-pi.sh's standard-tag er stadig `.7`.
