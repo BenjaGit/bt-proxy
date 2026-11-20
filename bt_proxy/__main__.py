@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import os
 import signal
 import socket
 import subprocess
@@ -136,7 +137,10 @@ async def async_main(args: argparse.Namespace) -> None:
     ble_manager = BLEManager(
         max_connections=args.max_connections,
         adapter=args.adapter,
+        pause_scan_on_connect=args.pause_scan_on_connect,
     )
+    if args.pause_scan_on_connect:
+        logger.info("Experiment: the BLE scanner is paused while connecting")
 
     server = APIServer(
         ble_manager=ble_manager,
@@ -206,6 +210,13 @@ def main() -> None:
         "--adapter",
         default=None,
         help="Bluetooth adapter (e.g. hci0). Uses default if not specified.",
+    )
+    parser.add_argument(
+        "--pause-scan-on-connect",
+        action="store_true",
+        default=os.environ.get("BT_PROXY_PAUSE_SCAN_ON_CONNECT", "") == "1",
+        help="Experiment: stop the BLE scanner while a connect is in flight "
+        "(also BT_PROXY_PAUSE_SCAN_ON_CONNECT=1)",
     )
     parser.add_argument(
         "--log-level",

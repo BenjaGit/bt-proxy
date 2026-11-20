@@ -443,9 +443,22 @@ def _bleak_props_to_int(properties: list[str]) -> int:
 class BLEManager:
     """Manages BLE scanning and active connections."""
 
-    def __init__(self, max_connections: int = 3, adapter: str | None = None):
+    def __init__(
+        self,
+        max_connections: int = 3,
+        adapter: str | None = None,
+        pause_scan_on_connect: bool = False,
+    ):
         self.max_connections = max_connections
         self._adapter = adapter
+        # Experiment (off by default): stop the scanner while a connect is in
+        # flight. On a single-radio controller active scanning resumes the
+        # moment a link is established, just when the first connection events
+        # decide whether the link survives (HCI 0x3E), and it competes with
+        # service discovery for the radio afterwards.
+        self._pause_scan_on_connect = pause_scan_on_connect
+        # Connects currently holding the scanner paused.
+        self._scan_pauses = 0
         self._connections: dict[int, BLEConnection] = {}
         self._connecting: set[int] = set()
         # Per-device connect-failure backoff: address -> (fail_count, next_ts).
@@ -738,9 +751,45 @@ class BLEManager:
             return False
         return True
 
+    async def _pause_scanner(self) -> bool:
+        """Stop the scanner for the duration of a connect, if enabled.
+
+        Returns whether the caller holds a pause and owes _resume_scanner().
+        Home Assistant is not told: the scanner is back within one connect
+        timeout, far below the time it takes an advertisement to go stale.
+        """
+        if not self._pause_scan_on_connect or not self._scanning:
+            return False
+        self._scan_pauses += 1
+        if self._scan_pauses == 1:
+            logger.debug("Pausing BLE scanner for a connect")
+            await self._teardown_scanner()
+        return True
+
+    async def _resume_scanner(self) -> None:
+        """Release a pause; the last one out starts the scanner again."""
+        self._scan_pauses -= 1
+        if self._scan_pauses > 0 or not self._scanning:
+            # Still paused by another connect, or stopped on request meanwhile.
+            return
+        logger.debug("Resuming BLE scanner after a connect")
+        try:
+            await self._start_scanner_with_retry(
+                passive=not self._effective_scan_active
+            )
+        except Exception as e:
+            # Hand over to the normal start path: it reports FAILED and
+            # re-arms the scanner slowly instead of leaving it down.
+            logger.warning("BLE scanner did not resume after a connect: %s", e)
+            await self._teardown_scanner()
+            self._scanning = False
+            await self.start_scanning()
+
     async def stop_scanning(self) -> None:
         """Stop BLE scanning."""
-        if not self._scanning or not self._scanner:
+        if not self._scanning:
+            return
+        if not self._scanner and self._scan_pauses == 0:
             return
 
         logger.info("Stopping BLE scanner")
@@ -865,8 +914,10 @@ class BLEManager:
             return False, 0, -1
 
         self._connecting.add(address)
+        scan_paused = False
 
         try:
+            scan_paused = await self._pause_scanner()
             # Look up cached BLEDevice from scanner
             ble_device = self._device_cache.get(mac.upper())
 
@@ -938,6 +989,8 @@ class BLEManager:
             return False, 0, -1
         finally:
             self._connecting.discard(address)
+            if scan_paused:
+                await self._resume_scanner()
 
     async def _bluez_clear_state(self, mac: str) -> None:
         """Disconnect a device in BlueZ to clear stale connection state."""
