@@ -1,14 +1,66 @@
 # BLE-forbindelser til Danfoss Eco: hvorfor kun ca. 1 af 4 lykkes
 
-Undersøgt 20/11-2026 (bestilt af homeassistant). Ingen ændringer er lavet på Pi'erne eller i koden.
+Undersøgt 20/11-2026 (bestilt af homeassistant). Tre forsøg kører fra 20/11 kl. 15:46, se nedenfor.
 
 ## Næste skridt
 
-1. Benjamin vælger, hvilke af forsøgene 1–4 nedenfor der skal køres. Forslag: forsøg 1 på
-   bt-proxy-1 og forsøg 2 på bt-proxy-2 samtidig, med bt-proxy-3 som kontrol, i 2–3 døgn.
-2. Find ud af, hvad der skete 10/11 kl. ca. 17 (se "Knækket 10/11"). Det kostede ca. 9
-   procentpoint og er ikke forklaret.
-3. Hardware (forsøg 5) først, når 1–4 er målt.
+1. **Mål lørdag 21/11 efter kl. 15:50** (24 t efter start): success-rate og varighed pr. Pi
+   fra hubben for 20/11 15:50 – 21/11 15:50 mod baseline 14/11–20/11 (bt-proxy-1 25 %,
+   bt-proxy-2 22 %, bt-proxy-3 20 %). Forespørgslen står under (b). Der er ingen urørt
+   kontrol-Pi, så sammenlign hver Pi med sin egen baseline.
+2. Behold det, der virker, permanent (se "Gør et forsøg permanent"), og rul resten tilbage.
+3. Knækket 10/11 kl. ca. 17 er stadig uforklaret (se "Knækket 10/11").
+
+## Forsøg i drift fra 20/11-2026 kl. 15:46
+
+Benjamin sagde ja til forsøg 1, 2 og 4, ét pr. Pi. Alle ændringer er lavet med overlay slået
+TIL, så de ligger kun i RAM: **en genstart af Pi'en ruller forsøget tilbage af sig selv.** Den
+ugentlige opdatering genstarter kun, hvis der er pakker at opdatere: bt-proxy-1 mandag 23/11
+kl. 04, bt-proxy-2 tirsdag 24/11, bt-proxy-3 onsdag 25/11. Tjek efter de tidspunkter, om
+forsøget stadig kører, før tallene bruges.
+
+| Pi | Forsøg | Startet | Ændring | Backup |
+|---|---|---|---|---|
+| bt-proxy-1 (kontor) | 1: GATT-cache for alle enheder | 15:45:33 | `/etc/bluetooth/main.conf`: begge linjer `Cache = yes` → `Cache = always`; bluetooth og bt-proxy genstartet | `/etc/bluetooth/main.conf.bak-20261120-forsoeg` |
+| bt-proxy-2 (gildesal) | 2: forbindelsesinterval 7,5–15 ms, supervision timeout 2 s | 15:45:59 | `/etc/bluetooth/main.conf` under `[LE]`: `MinConnectionInterval=6`, `MaxConnectionInterval=12`, `ConnectionSupervisionTimeout=200`; bluetooth og bt-proxy genstartet. Kernen viser 6/12/200 (før 24/40/42) | `/etc/bluetooth/main.conf.bak-20261120-forsoeg` |
+| bt-proxy-3 (stue) | 4: scanneren stoppes under connect | 15:46:26 | `/opt/bt-proxy` på tag `v1.0.3-benjagit.8` (før `.7`, ingen `uv sync`, så afhængighederne er uændrede); ny fil `/etc/systemd/system/bt-proxy.service.d/10-pause-scan.conf` med `Environment=BT_PROXY_PAUSE_SCAN_ON_CONNECT=1`; bt-proxy genstartet | ingen fil ændret; `.7` er stadig i git |
+
+`v1.0.3-benjagit.8` (commit b10ca44, pushet til BenjaGit) tilføjer kun flaget
+`--pause-scan-on-connect` / `BT_PROXY_PAUSE_SCAN_ON_CONNECT=1`. Uden flaget opfører den sig
+som `.7`. bt-proxy-1 og -2 kører stadig `.7`, og setup-pi.sh's standard-tag er stadig `.7`.
+
+### VIGTIGT før parring via bt-proxy-1
+
+**Sæt `Cache` tilbage til `yes` på bt-proxy-1, før en termostat parres gennem den** (rollback
+nedenfor). Med `Cache = always` giver BlueZ HA en gemt GATT-tabel uden nøglekarakteristikken
+(1002000b-…), som kun findes, mens knappen er trykket. Parringen fejler så med "button not
+pressed", også når knappen er trykket (set 18/10, se danfoss-eco-trv.md i HA-repoets memory).
+
+### Rollback
+
+Nemmest for alle tre: `sudo reboot` (overlay smider ændringerne væk). Uden genstart:
+
+- **bt-proxy-1:**
+  `sudo cp -p /etc/bluetooth/main.conf.bak-20261120-forsoeg /etc/bluetooth/main.conf && sudo rm -f /var/lib/bluetooth/*/cache/00:04:2F:* && sudo systemctl restart bluetooth && sleep 3 && sudo systemctl restart bt-proxy`
+- **bt-proxy-2:** samme `cp` og genstart af tjenesterne, men kernen beholder 6/12/200, til
+  Pi'en genstartes (set 19/10). Brug derfor `sudo reboot`.
+- **bt-proxy-3:**
+  `sudo rm /etc/systemd/system/bt-proxy.service.d/10-pause-scan.conf && sudo systemctl daemon-reload && git -C /opt/bt-proxy checkout -q v1.0.3-benjagit.7 && sudo systemctl restart bt-proxy`
+
+### Hvad der skal ses i målingen
+
+- **bt-proxy-1:** median-varigheden for vellykkede connects skal falde fra ca. 12 s til under
+  9 s. Sker det ikke, springer BlueZ ikke opdagelsen over, og forsøget kan stoppes.
+- **bt-proxy-2:** samme varighed, plus andelen "dropped the link" (baseline 36 %).
+- **bt-proxy-3:** andelen "dropped the link" (baseline 34 %). Hold øje med `bluetoothd is
+  wedged` og "BLE scanner did not resume" i journalen; upstream advarer om, at start og stop af
+  scanneren kan få bluetoothd til at hænge. Opstartslinjen "Experiment: the BLE scanner is
+  paused while connecting" viser, at flaget er slået til.
+
+### Gør et forsøg permanent
+
+Ændringerne skal ind i `deploy/setup-pi.sh` (main.conf-trinnet, hhv. standard-tag og flaget i
+ExecStart) og rulles ud med overlay fra → setup-pi.sh → overlay til. Ikke gjort.
 
 ## Konklusion
 
