@@ -4,12 +4,28 @@ Bestilt af danfoss-eco-ha 20/11-2026.
 
 ## Næste skridt
 
-1. **Deploy `v1.0.3-benjagit.9` til de tre Pi'er.** Kræver genstart af `bt-proxy` på hver; afventer
-   Benjamins ja. Rettelsen er committet, tagget og pushet, men kører ikke nogen steder endnu.
-2. Efter deploy: se i journalen efter `Closing … connected but unused for 60 s`. Hver linje er en
-   forbindelse, HA har efterladt.
-3. Indtil deploy kan fejlen komme igen. Luk hængende forbindelser uden genstart med kommandoen under
-   "Luk uden genstart".
+1. Se i journalen efter `Closing … connected but unused for 60 s`. Hver linje er en forbindelse, HA
+   har efterladt. Ingen set endnu (kl. 20:51); rettelsen er altså testet i `tests/`, men ikke set
+   virke i drift.
+2. Kontor 2 (`…95:76:85`) bliver forsøgt igen fra 20:45, men havde ikke fået en vellykket
+   forbindelse kl. 20:51 (timeout og tabt link, som ved de øvrige mislykkede forsøg). Tjek at den
+   kommer igennem.
+3. `.9` ligger kun i RAM på Pi'erne (overlay). En genstart af en Pi ruller den tilbage til `.7`, og
+   så er fejlen der igen. Gør den permanent: sæt `TAG=v1.0.3-benjagit.9` som standard i
+   `deploy/setup-pi.sh` og kør den uden om overlayet. Ikke gjort.
+4. danfoss-eco-ha ser efter, om HA-siden undlader at sende disconnect ved annullering.
+
+## I drift
+
+`v1.0.3-benjagit.9` deployet med Benjamins ja 20/11: bt-proxy-1 kl. 20:46:53, bt-proxy-2 kl.
+20:48:13, bt-proxy-3 kl. 20:49:31 (`git checkout` af tagget i `/opt/bt-proxy` og
+`systemctl restart bt-proxy`). Efter genstart: `Cache = always` på -1, interval 6/12/200 på -2 og
+`BT_PROXY_PAUSE_SCAN_ON_CONNECT=1` på -3 er uændrede.
+
+Efter lukningen kl. 20:43 forbindes gæstetoilet igen (20:45:32 og 20:48:36) og lager (20:50:07).
+
+Rul tilbage: `git -C /opt/bt-proxy checkout -q v1.0.3-benjagit.7` (bt-proxy-3: `.8`) og
+`sudo systemctl restart bt-proxy`, eller sæt `BT_PROXY_IDLE_TIMEOUT=0` i en drop-in.
 
 ## Hvad der skete
 
