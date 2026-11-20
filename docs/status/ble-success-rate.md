@@ -54,6 +54,24 @@ logges pr. forsøg:
 - Lukningen af ubrugte links (`.9`) ses nu i drift: 4 gange på bt-proxy-1 og 1 på bt-proxy-3 i
   vinduet. HA efterlader altså stadig links uden at lukke dem.
 
+## "Not found": vent på annoncering (`v1.0.3-benjagit.11`, bestilt af danfoss-eco-ha 20/11)
+
+"device … not found" betyder, at BlueZ ikke har enheden lige nu. BlueZ smider en ikke-parret enhed
+30 s efter sidste rapport (`TemporaryTimeout = 30`, standard, står udkommenteret i main.conf på
+alle tre), og controlleren rapporterer kun en kendt annoncør nu og da (målt 1–6 rapporter pr.
+termostat pr. minut). Det rammer derfor også stærke termostater: stue karnap på −60 dBm fik 10
+"not found" og 7 vellykkede på bt-proxy-3 kl. 21:50–22:20.
+
+`.11` venter op til 12 s (`ADVERT_WAIT_MAX`) på næste annoncering inden for anmodningens budget og
+forbinder så. Kommer den ikke, fejler anmodningen med "did not advertise within N s". Journalen
+viser ventetiden: `<MAC> advertised after X s, connecting`. På bt-proxy-3 kører scanneren under
+ventetiden, så scan-pausen er ikke længere ubrudt.
+
+Ikke prøvet: at hæve `TemporaryTimeout` i main.conf, så BlueZ beholder enhederne længere.
+
+Deployet 20/11 kl. 22:30:43, 22:31:06 og 22:31:30 sammen med rettelsen af dobbelt disconnect (se
+`haengende-forbindelser.md`). Måling 22:33–23:03: se nederst i dette afsnit, når den er lavet.
+
 ## Forsøg i drift fra 20/11-2026 kl. 15:46
 
 Benjamin sagde ja til forsøg 1, 2 og 4, ét pr. Pi. Alle ændringer er lavet med overlay slået

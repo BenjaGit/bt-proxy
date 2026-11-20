@@ -27,6 +27,34 @@ Efter lukningen kl. 20:43 forbindes gæstetoilet igen (20:45:32 og 20:48:36) og 
 Rul tilbage: `git -C /opt/bt-proxy checkout -q v1.0.3-benjagit.7` (bt-proxy-3: `.8`) og
 `sudo systemctl restart bt-proxy`, eller sæt `BT_PROXY_IDLE_TIMEOUT=0` i en drop-in.
 
+## Den egentlige årsag (fundet 20/11 kl. 22:25, rettet i `v1.0.3-benjagit.11`)
+
+Afsnittet "Årsag" nedenfor gættede på en annullering i HA. Det var forkert. Forløbet, set i
+journalen på bt-proxy-1 og i HA's log (gang `…09:A2`, lokal tid):
+
+1. 22:12:18.606 proxyen forbinder til stue karnap; det fejler efter 30 s kl. 22:12:48.617.
+2. 22:12:48.619 proxyen går i gang med gang, 2 ms senere. HA havde sendt den anmodning, mens den
+   forrige stadig kørte. Proxyen behandler beskeder én ad gangen, så den stod i kø.
+3. Kø + 16,7 s opkobling er over HA's ventetid, så HA giver op og sender en disconnect. Den udføres
+   2 ms efter "Connected" (22:13:05.328).
+4. Proxyen sendte **to** "disconnected" til HA: én da linket gik ned (22:13:07.508) og kvitteringen
+   ca. 1,1 s senere, efter BlueZ-oprydningen.
+5. HA havde efter den første sendt sit næste connect (22:13:08.661) og læste den sene kvittering
+   som at det fejlede ("Disconnected" 7 ms senere). Proxyen forbandt alligevel kl. 22:13:20, og
+   ingen brugte eller lukkede linket.
+
+Rettet: ét svar pr. disconnect-anmodning, sendt når linket er nede; BlueZ-oprydningen kører
+bagefter. En rapport fra BlueZ om et allerede frigivet link sendes ikke videre og kan ikke
+afregistrere et nyere link til samme adresse. Test: `tests/test_api_cleanup.py`,
+`tests/test_connection_tracking.py`.
+
+Ikke rettet i proxyen: køen (punkt 2). Anmodninger behandles stadig én ad gangen, så et connect, der
+sendes mens et andet kører, bruger af HA's ventetid i køen. danfoss_eco er bedt om aldrig at sende
+to connects til samme proxy samtidig. Mulig rettelse her, hvis det ikke er nok: regn budgettet fra
+anmodningen ankom, og svar fejl med det samme, hvis der er for lidt tilbage.
+
+Deployet 20/11 kl. 22:30:43 (bt-proxy-1), 22:31:06 (-2), 22:31:30 (-3).
+
 ## Hvad der skete
 
 bt-proxy-1 holdt tre forbindelser i over en time (kontor 2 `…95:76:85` fra 19:09:52, lager
