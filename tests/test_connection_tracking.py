@@ -127,15 +127,57 @@ def test_late_callback_from_an_earlier_attempt_is_ignored(manager, monkeypatch):
     assert manager.get_connection(ADDRESS) is None
 
 
-# Home Assistant (aioesphomeapi) gives up on a connect request after 20 s.
-HA_CONNECT_RESPONSE_TIMEOUT = 20.0
+def _timed(coro):
+    start = time.monotonic()
+    result = asyncio.run(coro)
+    return result, time.monotonic() - start
+
+
+# danfoss_eco v1.3.0+benjagit.15 waits this long for the answer to a connect
+# request (aioesphomeapi's own default is 20 s).
+HA_CONNECT_RESPONSE_TIMEOUT = 40.0
 
 
 def test_connect_answers_within_home_assistant_timeout():
     # A slower answer arrives after HA has moved on: the attempt is wasted and
     # the late link has to be torn down again.
-    budget = ble_manager.CONNECT_TIMEOUT + ble_manager.MTU_ACQUIRE_TIMEOUT
-    assert budget * ble_manager.CONNECT_MAX_RETRIES < HA_CONNECT_RESPONSE_TIMEOUT
+    slowest_success = ble_manager.CONNECT_TIMEOUT + ble_manager.MTU_ACQUIRE_TIMEOUT
+    slowest_failure = (
+        ble_manager.CONNECT_TIMEOUT + ble_manager.CONNECT_CLEANUP_TIMEOUT
+    )
+    assert ble_manager.CONNECT_MAX_RETRIES == 1
+    assert max(slowest_success, slowest_failure) < HA_CONNECT_RESPONSE_TIMEOUT
+
+
+def test_the_budget_leaves_room_to_retry_a_dropped_link():
+    # Danfoss eTRVs drop the link 7 or 11 s into an attempt. Either way there
+    # must be enough of the request's budget left for a second attempt.
+    left = ble_manager.CONNECT_TIMEOUT - 11.0 - ble_manager.DROP_RETRY_DELAY
+    assert left >= ble_manager.DROP_RETRY_MIN_REMAINING
+
+
+def test_teardown_of_a_failed_attempt_is_bounded(manager, monkeypatch):
+    monkeypatch.setattr(ble_manager, "CONNECT_TIMEOUT", 0.1)
+    monkeypatch.setattr(ble_manager, "CONNECT_CLEANUP_TIMEOUT", 0.1)
+
+    async def stuck(self):
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(FakeClient, "disconnect", stuck)
+    FakeClient.script = ["hang"]
+    (ok, _mtu, _error), elapsed = _timed(manager.connect_device(ADDRESS))
+    assert not ok
+    assert elapsed < 0.5
+
+
+def test_connect_timeout_can_be_set_per_proxy(monkeypatch):
+    monkeypatch.setattr(ble_manager, "BleakClient", FakeClient)
+    FakeClient.instances = []
+    FakeClient.script = ["hang"]
+    mgr = ble_manager.BLEManager(connect_timeout=0.1)
+    (ok, _mtu, _error), elapsed = _timed(mgr.connect_device(ADDRESS))
+    assert not ok
+    assert elapsed < 1.0
 
 
 def test_a_failed_request_is_answered_after_one_attempt(manager):
@@ -157,12 +199,6 @@ def test_first_failure_does_not_block_the_next_request(manager):
     FakeClient.script = ["fail"]
     asyncio.run(manager.connect_device(ADDRESS))
     assert manager._connect_backoff_remaining(ADDRESS) > 0
-
-
-def _timed(coro):
-    start = time.monotonic()
-    result = asyncio.run(coro)
-    return result, time.monotonic() - start
 
 
 def test_a_link_dropped_while_connecting_is_retried_at_once(manager):

@@ -15,7 +15,7 @@ from zeroconf.asyncio import AsyncServiceInfo, AsyncZeroconf
 
 from . import EMULATED_ESPHOME_VERSION
 from .api_server import APIServer
-from .ble_manager import IDLE_DISCONNECT_TIMEOUT, BLEManager
+from .ble_manager import CONNECT_TIMEOUT, IDLE_DISCONNECT_TIMEOUT, BLEManager
 
 logger = logging.getLogger(__name__)
 
@@ -139,6 +139,7 @@ async def async_main(args: argparse.Namespace) -> None:
         adapter=args.adapter,
         pause_scan_on_connect=args.pause_scan_on_connect,
         idle_timeout=args.idle_timeout,
+        connect_timeout=args.connect_timeout,
     )
     if args.pause_scan_on_connect:
         logger.info("Experiment: the BLE scanner is paused while connecting")
@@ -218,6 +219,14 @@ def main() -> None:
         default=os.environ.get("BT_PROXY_PAUSE_SCAN_ON_CONNECT", "") == "1",
         help="Experiment: stop the BLE scanner while a connect is in flight "
         "(also BT_PROXY_PAUSE_SCAN_ON_CONNECT=1)",
+    )
+    parser.add_argument(
+        "--connect-timeout",
+        type=float,
+        default=float(os.environ.get("BT_PROXY_CONNECT_TIMEOUT", CONNECT_TIMEOUT)),
+        help="Seconds one connect request may take, retries after a dropped "
+        f"link included (default: {CONNECT_TIMEOUT:.0f}; also "
+        "BT_PROXY_CONNECT_TIMEOUT). The client must wait longer than this.",
     )
     parser.add_argument(
         "--idle-timeout",

@@ -10,6 +10,28 @@ Undersøgt 20/11-2026 (bestilt af homeassistant). Tre forsøg kører fra 20/11 k
    kontrol-Pi, så sammenlign hver Pi med sin egen baseline.
 2. Behold det, der virker, permanent (se "Gør et forsøg permanent"), og rul resten tilbage.
 3. Knækket 10/11 kl. ca. 17 er stadig uforklaret (se "Knækket 10/11").
+4. **bt-proxy-3 blev drejet 20/11 kl. ca. 21:05** (se "bt-proxy-3 drejet"). Tallene for bt-proxy-3
+   efter det tidspunkt blander scan-pausen og drejningen; del målingen i før og efter 21:05.
+5. Benjamin vil flytte bt-proxy-3 op på et skab, når han har en forlængerledning. Mål signalet
+   igen bagefter med kommandoen under "bt-proxy-3 drejet".
+
+## Connect-budget 30 s (`v1.0.3-benjagit.10`, bestilt af danfoss-eco-ha 20/11)
+
+Benjamin sagde ja til to ændringer: tidsgrænsen for en connect-anmodning fra 15 s til 30 s, og
+nyt forsøg med det samme, når linket tabes under opkobling.
+
+- `CONNECT_TIMEOUT` er nu 30 s. Genforsøg efter tabt link fandtes allerede, men kørte aldrig: det
+  kræver 10 s tilbage af budgettet, og linket tabes typisk 7 eller 11 s inde i et forsøg på 15 s.
+  Med 30 s er der plads til ét eller to nye forsøg i samme anmodning.
+- Oprydning efter et mislykket forsøg er begrænset til 5 s, så svaret kommer senest efter ca. 35 s.
+  **HA skal vente længere end det:** danfoss_eco `.15` venter 40 s. Med `.14` (20 s) giver HA op
+  før proxyen, og de næste anmodninger står i kø bag den.
+- Kan sættes pr. Pi uden ny version: `BT_PROXY_CONNECT_TIMEOUT=<sekunder>` i en drop-in.
+- Spærringen efter gentagne fejl (5 s pr. fejl i træk, højst 60 s) er uændret.
+
+Før-tal fra danfoss-eco-ha, 40 min før kl. 21:40 (forsøg / ok / tabt / timeout / not found):
+bt-proxy-1 197 / 62 / 60 / 56 / 16, bt-proxy-2 180 / 66 / 43 / 49 / 18, bt-proxy-3 135 / 34 / 44 /
+22 / 31. Efter-tal og deploy-tidspunkt: se nederst i dette afsnit, når de er målt.
 
 ## Forsøg i drift fra 20/11-2026 kl. 15:46
 
@@ -32,6 +54,45 @@ som `.7`. bt-proxy-1 og -2 kører stadig `.7`, og setup-pi.sh's standard-tag er 
 Verificeret 20/11 kl. 15:59 fra hubben: alle tre tjenester er aktive og forbinder. Efter
 ændringen: bt-proxy-1 3 vellykkede af 8 forsøg, bt-proxy-2 2 af 7, bt-proxy-3 1 af 8. Ingen
 "wedged" eller "did not resume". Tallene er for få til at sige noget om effekten.
+
+Fra 20/11 kl. 20:47–20:50 kører alle tre `v1.0.3-benjagit.9` (lukker ubrugte links, se
+`haengende-forbindelser.md`). Forsøgene er uændrede; rollback på bt-proxy-3 skal derfor gå til
+`.9`, ikke `.7`, hvis kun scan-pausen skal væk.
+
+### bt-proxy-3 drejet 20/11 kl. ca. 21:05
+
+Pi'en i stuen vendte USB-stikkene mod stue vest-radiatoren, som sad i luftlinjen til termostaten.
+Antennen på 3B+ sidder i hjørnet ved GPIO-stikkets ende og er svagest hen over printet mod USB- og
+netværksstikkene. Benjamin drejede den, så antennehjørnet vender mod radiatoren. Samme plads, samme
+højde.
+
+Signal målt på Pi'en i 60 s før og efter (BlueZ, 1–6 målinger pr. termostat, så under ca. 5 dB er
+støj):
+
+| Radiator | MAC | Før 21:03 | Efter 21:09 |
+|---|---|---|---|
+| Stue vest | `…95:32:CF` | −77 | −61 |
+| Gang | `…0F:09:A2` | −85 | −76 |
+| Soveværelse | `…6A:BA:29` | −90 | −83 |
+| Kontor 1 | `…B2:AB:A2` | −91 | −84 |
+| Makerspace | `…0F:13:1D` | −73 | −72 |
+| Stue karnap | `…6A:BA:A4` | −60 | −62 |
+| Spisestue | `…95:32:9E` | −67 | −72 |
+| Gildesal vest midt | `…CF:04:D0` | −94 | ikke hørt |
+| Garderobe | `…0F:09:E3` | ikke hørt | −79 |
+| Gildesal vest syd | `…B2:77:06` | ikke hørt | −82 |
+| Køkken | `…95:84:AF` | ikke hørt | −82 |
+| Gæsteværelse | `…0F:13:1A` | ikke hørt | −89 |
+| Kontor 2 | `…95:76:85` | ikke hørt | −89 |
+
+"Ikke hørt" i før-målingen kan også skyldes, at termostaten var midt i en forbindelse. Om det
+giver flere vellykkede forbindelser til stue vest (12 % i baseline-ugen), er ikke målt endnu.
+
+Mål igen (proxyen logger ikke RSSI, så det læses fra BlueZ):
+
+```
+ssh bt-proxy-3 '(sleep 60 | timeout 65 bluetoothctl) | grep -oE "00:04:2F:[0-9A-F:]{8} RSSI: 0x[0-9a-f]+ \(-[0-9]+\)"'
+```
 
 ### VIGTIGT før parring via bt-proxy-1
 

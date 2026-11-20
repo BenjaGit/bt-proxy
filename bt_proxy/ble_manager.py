@@ -40,21 +40,30 @@ logger = logging.getLogger(__name__)
 DEFAULT_MTU = 23
 MTU_ACQUIRE_TIMEOUT = 3.0
 
-# Connection retry settings. Home Assistant (aioesphomeapi) waits 20 s for the
-# answer to a connect request and retries on its own (bleak_retry_connector),
-# so one attempt that answers within that window beats internal retries whose
-# late success nobody is waiting for: CONNECT_TIMEOUT + MTU_ACQUIRE_TIMEOUT
-# must stay below 20 s.
-CONNECT_TIMEOUT = 15.0
+# Time budget for one connect request, including the retries after a dropped
+# link (below). A successful connect to a Danfoss eTRV takes 9-12 s (median)
+# and up to 14 s for nine in ten, so the earlier 15 s cut off attempts that
+# were about to succeed and left no room for a second try.
+#
+# The client must wait longer than this for the answer. aioesphomeapi waits
+# 20 s by default; danfoss_eco v1.3.0+benjagit.15 waits 40 s. The worst case
+# here is CONNECT_TIMEOUT + CONNECT_CLEANUP_TIMEOUT (a failed attempt) or
+# CONNECT_TIMEOUT + MTU_ACQUIRE_TIMEOUT (a success at the last moment). A
+# client that gives up earlier asks for a disconnect, which is carried out as
+# soon as the connect is done. --connect-timeout / BT_PROXY_CONNECT_TIMEOUT
+# overrides it.
+CONNECT_TIMEOUT = 30.0
+# Tearing down a failed attempt must not stretch the answer much further.
+CONNECT_CLEANUP_TIMEOUT = 5.0
 CONNECT_RETRY_DELAY = 2.0
 CONNECT_MAX_RETRIES = 1
 
 # A link that comes up and drops before connect() returns (HCI 0x3E, "connection
 # failed to be established": the peripheral never answered the first connection
-# events) leaves connect() waiting out CONNECT_TIMEOUT, so Home Assistant's own
-# retry gets too little of its 20 s to catch the device again. Seen with Danfoss
-# eTRVs, which often answer a fresh attempt a few seconds later. Such attempts
-# are retried here, within the CONNECT_TIMEOUT budget of the one request. An
+# events) would leave connect() waiting out CONNECT_TIMEOUT. Seen with Danfoss
+# eTRVs, typically 7 or 11 s into the attempt, and they often answer a fresh
+# attempt a few seconds later. Such attempts are retried here at once, within
+# the CONNECT_TIMEOUT budget of the one request, instead of failing it. An
 # attempt waits for an advertisement to connect on (an eTRV advertises about
 # every 4 s, sometimes only every 8 s) and then needs about 5.5 s for service
 # discovery, which BleakClient.connect() includes. A retry started with less
@@ -243,7 +252,9 @@ class BLEConnection:
             connecting.cancel()
             await asyncio.gather(connecting, return_exceptions=True)
             try:
-                await self.client.disconnect()
+                await asyncio.wait_for(
+                    self.client.disconnect(), CONNECT_CLEANUP_TIMEOUT
+                )
             except Exception:  # noqa: BLE001 - best effort, the link is gone
                 pass
             if dropped.is_set():
@@ -469,8 +480,11 @@ class BLEManager:
         adapter: str | None = None,
         pause_scan_on_connect: bool = False,
         idle_timeout: float = IDLE_DISCONNECT_TIMEOUT,
+        connect_timeout: float | None = None,
     ):
         self.max_connections = max_connections
+        # Time budget for one connect request; None follows CONNECT_TIMEOUT.
+        self._connect_timeout = connect_timeout
         # Seconds a link may sit unused before it is closed; 0 turns it off.
         self._idle_timeout = idle_timeout
         self._idle_task: asyncio.Task | None = None
@@ -954,7 +968,7 @@ class BLEManager:
             self._connections[address] = conn
 
             last_error: Exception | None = None
-            deadline = time.monotonic() + CONNECT_TIMEOUT
+            deadline = time.monotonic() + (self._connect_timeout or CONNECT_TIMEOUT)
             dropped = False
             attempt = 0
             while True:
