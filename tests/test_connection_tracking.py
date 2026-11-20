@@ -270,3 +270,78 @@ def test_in_progress_state_is_cleared_even_on_the_last_attempt(manager, monkeypa
     ok, _mtu, _error = asyncio.run(manager.connect_device(ADDRESS))
     assert not ok
     assert removed == ["00:04:2F:0F:09:A2"]
+
+
+def test_a_requested_disconnect_is_not_reported_a_second_time(manager):
+    # The request handler answers the client. BlueZ reporting the same link
+    # down must not add a second "disconnected": Home Assistant reads it as
+    # the failure of the connect it sends next.
+    FakeClient.script = ["ok"]
+    asyncio.run(manager.connect_device(ADDRESS))
+    live = FakeClient.instances[-1]
+
+    async def release():
+        await manager.disconnect_device(ADDRESS)
+        live.fire_disconnected()
+        await asyncio.sleep(0)
+
+    asyncio.run(release())
+    assert manager.reported_disconnects == []
+
+
+def test_report_from_a_released_link_does_not_untrack_the_next_one(manager):
+    FakeClient.script = ["ok", "ok"]
+    asyncio.run(manager.connect_device(ADDRESS))
+    old = FakeClient.instances[-1]
+    asyncio.run(manager.disconnect_device(ADDRESS))
+    asyncio.run(manager.connect_device(ADDRESS))
+
+    old.fire_disconnected()
+    assert manager.get_connection(ADDRESS) is not None
+    assert manager.reported_disconnects == []
+
+
+MAC = "00:04:2F:0F:09:A2"
+
+
+class _Seen:
+    address = MAC
+
+
+def test_device_unknown_to_bluez_is_connected_once_it_advertises(manager):
+    # BlueZ drops a device it has had no report from for 30 s, also in good
+    # range. The next advertisement brings it back.
+    manager._scanning = True
+    manager._adv_callback = None
+    FakeClient.script = ["notfound", "ok"]
+
+    async def run():
+        task = asyncio.ensure_future(manager.connect_device(ADDRESS))
+        await asyncio.sleep(0.05)
+        assert not task.done()
+        manager._detection_callback(_Seen(), None)
+        return await task
+
+    ok, _mtu, _error = asyncio.run(run())
+    assert ok
+    assert len(FakeClient.instances) == 2
+
+
+def test_device_that_stays_silent_fails_after_the_wait(manager, monkeypatch):
+    monkeypatch.setattr(ble_manager, "ADVERT_WAIT_MAX", 0.05)
+    manager._scanning = True
+    FakeClient.script = ["notfound", "ok"]
+    (ok, _mtu, _error), elapsed = _timed(manager.connect_device(ADDRESS))
+    assert not ok
+    assert len(FakeClient.instances) == 1
+    assert elapsed < 0.5
+
+
+def test_no_wait_for_an_advertisement_without_room_to_connect_after(manager, monkeypatch):
+    monkeypatch.setattr(ble_manager, "CONNECT_TIMEOUT", 0.3)
+    monkeypatch.setattr(ble_manager, "DROP_RETRY_MIN_REMAINING", 0.3)
+    manager._scanning = True
+    FakeClient.script = ["notfound", "ok"]
+    (ok, _mtu, _error), elapsed = _timed(manager.connect_device(ADDRESS))
+    assert not ok
+    assert elapsed < 0.2

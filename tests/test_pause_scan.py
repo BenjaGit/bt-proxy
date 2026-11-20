@@ -43,6 +43,9 @@ class FakeClient:
 
     async def connect(self):
         FakeScanner.events.append("connect")
+        if FakeClient.outcome == "notfound-once":
+            FakeClient.outcome = "ok"
+            raise BleakError("device 'dev_00_04_2F_0F_09_A2' not found")
         if FakeClient.outcome == "fail":
             raise BleakError("[org.bluez.Error.Failed] br-connection-canceled")
         self.is_connected = True
@@ -148,3 +151,24 @@ def test_stop_request_during_a_pause_is_honoured(monkeypatch):
     assert ok
     assert FakeScanner.events == ["scan-stop", "connect"]
     assert not mgr._scanning
+
+
+def test_scanner_runs_while_waiting_for_the_device_to_advertise(monkeypatch):
+    # With the scanner stopped nothing is heard, so a device BlueZ has dropped
+    # would never come back during the connect.
+    mgr = make_manager(monkeypatch, pause=True)
+    FakeClient.outcome = "notfound-once"
+
+    async def run():
+        await mgr.start_scanning()
+        FakeScanner.events.clear()
+        task = asyncio.ensure_future(mgr.connect_device(ADDRESS))
+        await asyncio.sleep(0.05)
+        mgr._advert_waiters["00:04:2F:0F:09:A2"].set()
+        return await task
+
+    ok, _mtu, _err = asyncio.run(run())
+    assert ok
+    assert FakeScanner.events == [
+        "scan-stop", "connect", "scan-start", "scan-stop", "connect", "scan-start",
+    ]

@@ -23,14 +23,24 @@ class FakeBLE:
         self.free_connections = 3
         self.max_connections = 3
         self.allocated_addresses: list[int] = []
+        self.cleanups: list[str] = []
+        self.writer = None
+        self.sent_before_cleanup = b""
 
     async def connect_device(self, address):
         self.connected.add(address)
         return True, 23, 0
 
-    async def disconnect_device(self, address):
+    async def disconnect_device(self, address, clear_state=True):
         self.disconnect_calls.append(address)
         self.connected.discard(address)
+        return proto.int_to_mac(address)
+
+    async def clear_bluez_state(self, mac):
+        # Takes about a second on a Pi; long enough for the client to act on
+        # whatever was sent before it.
+        self.cleanups.append(mac)
+        self.sent_before_cleanup = bytes(self.writer.sent) if self.writer else b""
 
 
 class FakeWriter:
@@ -171,3 +181,35 @@ def test_link_lost_on_its_own_is_not_disconnected_again():
 
     asyncio.run(scenario())
     assert ble.disconnect_calls == []
+
+
+def test_a_disconnect_request_gets_one_answer_before_the_bluez_cleanup():
+    # 20/11-2026: the answer used to come after the cleanup (about a second),
+    # on top of the "disconnected" already pushed when the link went down.
+    # Home Assistant had sent its next connect by then, took the late answer
+    # for that connect failing, and left the link the proxy brought up.
+    ble = FakeBLE()
+    disconnect = proto.encode_field_varint(1, ADDRESS) + proto.encode_field_varint(
+        2, proto.BLE_REQUEST_DISCONNECT
+    )
+
+    async def scenario():
+        reader = asyncio.StreamReader()
+        reader.feed_data(
+            _frame(proto.MSG_BLE_DEVICE_REQUEST, _connect_request(ADDRESS))
+            + _frame(proto.MSG_BLE_DEVICE_REQUEST, disconnect)
+        )
+        reader.feed_eof()
+        ble.writer = FakeWriter()
+        conn = api_server.APIConnection(reader, ble.writer, FakeServer(ble))
+        await asyncio.wait_for(conn.run(), 1.0)
+        return bytes(ble.writer.sent)
+
+    sent = asyncio.run(scenario())
+    gone = _frame(
+        proto.MSG_BLE_DEVICE_CONNECTION_RESPONSE,
+        proto.encode_ble_device_connection_response(ADDRESS, False, 0, 0),
+    )
+    assert sent.count(gone) == 1
+    assert ble.cleanups == [proto.int_to_mac(ADDRESS)]
+    assert gone in ble.sent_before_cleanup

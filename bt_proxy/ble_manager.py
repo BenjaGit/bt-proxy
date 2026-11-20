@@ -72,6 +72,16 @@ CONNECT_MAX_RETRIES = 1
 DROP_RETRY_DELAY = 0.5
 DROP_RETRY_MIN_REMAINING = 10.0
 
+# "device ... not found" means BlueZ has no object for the device right now. It
+# drops a device it has not had a report from for a while (TemporaryTimeout,
+# 30 s by default), and the controller reports a known advertiser only now and
+# then, so this also hits devices in good range: seen on a thermostat at
+# -60 dBm that connected fine a minute earlier. The next reported advertisement
+# brings the device back, so wait for that (within the request's budget)
+# instead of failing the request. Covers three advertising intervals and one
+# restart of the kernel's scan cycle.
+ADVERT_WAIT_MAX = 12.0
+
 # Per-device connect-failure backoff. Home Assistant retries failed connections
 # aggressively; without a brake we relay every retry straight to BlueZ and the
 # controller, and that churn can tip a flaky single-radio adapter over the edge
@@ -175,7 +185,7 @@ class BLEConnection:
     def __init__(
         self,
         address: int,
-        on_disconnect: Callable[[int], None],
+        on_disconnect: Callable[[BLEConnection], None],
         on_notify: Callable[[int, int, bytes], None],
     ):
         self.address = address
@@ -216,7 +226,7 @@ class BLEConnection:
             self._dropped_while_connecting.set()
         logger.info("Device %s disconnected", self.mac)
         self._notify_handles.clear()
-        self._on_disconnect(self.address)
+        self._on_disconnect(self)
 
     async def connect(
         self, ble_device: BLEDevice | None = None, timeout: float | None = None
@@ -499,6 +509,8 @@ class BLEManager:
         self._scan_pauses = 0
         self._connections: dict[int, BLEConnection] = {}
         self._connecting: set[int] = set()
+        # Connects waiting for their device to advertise: MAC -> event.
+        self._advert_waiters: dict[str, asyncio.Event] = {}
         # Per-device connect-failure backoff: address -> (fail_count, next_ts).
         # Throttles reconnect storms so we don't hammer a flaky controller.
         self._connect_backoff: dict[int, tuple[int, float]] = {}
@@ -554,6 +566,9 @@ class BLEManager:
         """Called by BleakScanner for each advertisement."""
         # Cache the BLEDevice object for use in connections
         self._device_cache[device.address.upper()] = device
+        waiter = self._advert_waiters.get(device.address.upper())
+        if waiter is not None:
+            waiter.set()
 
         if self._adv_callback is None:
             return
@@ -849,8 +864,20 @@ class BLEManager:
             await self.stop_scanning()
             await self.start_scanning()
 
-    def _handle_disconnect(self, address: int) -> None:
-        """Internal disconnect handler."""
+    async def _wait_for_advertisement(self, mac: str, timeout: float) -> bool:
+        """Wait until the scanner reports the device; False if it stays silent."""
+        waiter = self._advert_waiters[mac.upper()] = asyncio.Event()
+        try:
+            await asyncio.wait_for(waiter.wait(), timeout)
+            return True
+        except asyncio.TimeoutError:
+            return False
+        finally:
+            self._advert_waiters.pop(mac.upper(), None)
+
+    def _handle_disconnect(self, conn: BLEConnection) -> None:
+        """A link went down (reported by BlueZ)."""
+        address = conn.address
         if address in self._connecting:
             # connect_device() still owns this connection and reports the
             # outcome itself; untracking it here orphans a later retry's link.
@@ -859,10 +886,17 @@ class BLEManager:
                 proto.int_to_mac(address),
             )
             return
-        conn = self._connections.pop(address, None)
-        if conn:
-            # Schedule BlueZ cleanup in background
-            asyncio.ensure_future(self._bluez_clear_state(conn.mac))
+        if self._connections.get(address) is not conn:
+            # Already released (the client asked for the disconnect and gets
+            # its answer from that request) or a leftover from an earlier
+            # link. Telling the client again would hit whatever it does next:
+            # Home Assistant reads a second "disconnected" as the failure of
+            # the connect it has just sent, and walks away from it.
+            logger.debug("Disconnect of %s was already handled", conn.mac)
+            return
+        del self._connections[address]
+        # Schedule BlueZ cleanup in background
+        asyncio.ensure_future(self._bluez_clear_state(conn.mac))
         if self._disconnect_callback:
             self._disconnect_callback(address)
 
@@ -994,6 +1028,33 @@ class BLEManager:
                     # A dropped link, and BlueZ forgetting the device right
                     # after one, are retried within this request's budget.
                     dropped = dropped or isinstance(e, LinkDroppedWhileConnecting)
+                    if "not found" in err_str and self._scanning:
+                        # BlueZ has dropped the device; the next advertisement
+                        # brings it back.
+                        wait = min(
+                            ADVERT_WAIT_MAX,
+                            deadline - time.monotonic() - DROP_RETRY_MIN_REMAINING,
+                        )
+                        if wait <= 0:
+                            break
+                        if scan_paused:
+                            # Nothing is heard with the scanner stopped.
+                            await self._resume_scanner()
+                            scan_paused = False
+                        started = time.monotonic()
+                        if not await self._wait_for_advertisement(mac, wait):
+                            logger.info(
+                                "%s did not advertise within %.0f s", mac, wait
+                            )
+                            break
+                        logger.info(
+                            "%s advertised after %.1f s, connecting",
+                            mac,
+                            time.monotonic() - started,
+                        )
+                        scan_paused = await self._pause_scanner()
+                        ble_device = self._device_cache.get(mac.upper())
+                        continue
                     if dropped and (
                         isinstance(e, LinkDroppedWhileConnecting)
                         or "not found" in err_str
@@ -1059,13 +1120,24 @@ class BLEManager:
         except Exception:
             pass
 
-    async def disconnect_device(self, address: int) -> None:
-        """Disconnect from a BLE device."""
+    async def disconnect_device(self, address: int, clear_state: bool = True) -> str | None:
+        """Disconnect from a BLE device; returns its MAC if a link was tracked.
+
+        The client is not told from here: whoever asked answers it. With
+        clear_state=False the caller runs clear_bluez_state() itself, after
+        it has answered.
+        """
         conn = self._connections.pop(address, None)
-        if conn:
-            await conn.disconnect()
-            # Also clear BlueZ state to prevent InProgress on next connect
-            await self._bluez_clear_state(conn.mac)
+        if not conn:
+            return None
+        await conn.disconnect()
+        if clear_state:
+            await self.clear_bluez_state(conn.mac)
+        return conn.mac
+
+    async def clear_bluez_state(self, mac: str) -> None:
+        """Clear BlueZ state for a released link (prevents InProgress next time)."""
+        await self._bluez_clear_state(mac)
 
     def get_connection(self, address: int) -> BLEConnection | None:
         """Get an active connection by address (counts as the client using it)."""

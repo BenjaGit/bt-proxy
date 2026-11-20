@@ -275,14 +275,20 @@ class APIConnection:
                 self._send_connections_free()
 
         elif request_type == proto.BLE_REQUEST_DISCONNECT:
+            # Exactly one answer per disconnect request, sent as soon as the
+            # link is down. The BlueZ cleanup takes about a second; an answer
+            # after it used to arrive when Home Assistant had already sent its
+            # next connect, which it then took for failed.
             self._owned.discard(address)
-            await ble.disconnect_device(address)
+            mac = await ble.disconnect_device(address, clear_state=False)
             resp = proto.encode_ble_device_connection_response(
                 address, False, 0, 0
             )
             self._send_message(proto.MSG_BLE_DEVICE_CONNECTION_RESPONSE, resp)
             if self._subscribed_connections_free:
                 self._send_connections_free()
+            if mac:
+                await ble.clear_bluez_state(mac)
 
         elif request_type == proto.BLE_REQUEST_PAIR:
             # Pairing not directly supported through bleak
