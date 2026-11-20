@@ -29,6 +29,10 @@ forsøget stadig kører, før tallene bruges.
 `--pause-scan-on-connect` / `BT_PROXY_PAUSE_SCAN_ON_CONNECT=1`. Uden flaget opfører den sig
 som `.7`. bt-proxy-1 og -2 kører stadig `.7`, og setup-pi.sh's standard-tag er stadig `.7`.
 
+Verificeret 20/11 kl. 15:59 fra hubben: alle tre tjenester er aktive og forbinder. Efter
+ændringen: bt-proxy-1 3 vellykkede af 8 forsøg, bt-proxy-2 2 af 7, bt-proxy-3 1 af 8. Ingen
+"wedged" eller "did not resume". Tallene er for få til at sige noget om effekten.
+
 ### VIGTIGT før parring via bt-proxy-1
 
 **Sæt `Cache` tilbage til `yes` på bt-proxy-1, før en termostat parres gennem den** (rollback
