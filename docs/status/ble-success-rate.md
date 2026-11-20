@@ -70,7 +70,25 @@ ventetiden, så scan-pausen er ikke længere ubrudt.
 Ikke prøvet: at hæve `TemporaryTimeout` i main.conf, så BlueZ beholder enhederne længere.
 
 Deployet 20/11 kl. 22:30:43, 22:31:06 og 22:31:30 sammen med rettelsen af dobbelt disconnect (se
-`haengende-forbindelser.md`). Måling 22:33–23:03: se nederst i dette afsnit, når den er lavet.
+`haengende-forbindelser.md`).
+
+Målt fra hubben 22:33–23:03, pr. anmodning:
+
+| Pi | Anmodninger | Ok | Tabt link | Timeout 30 s | Not found | Ok-andel | `.10` | Før `.10` |
+|---|---|---|---|---|---|---|---|---|
+| bt-proxy-1 | 77 | 50 | 17 | 9 | 1 | 65 % | 56 % | 31 % |
+| bt-proxy-2 | 74 | 54 | 14 | 6 | 0 | 73 % | 61 % | 37 % |
+| bt-proxy-3 | 57 | 44 | 8 | 5 | 0 | 77 % | 37 % | 25 % |
+
+- "Not found" er væk som fejl: 18 gange kendte BlueZ ikke enheden (10, 1 og 7), 17 gange kom
+  annonceringen inden for ventetiden (median 3,9 s, længst 10,0 s), én gang ikke.
+- Ingen efterladte links: 0 "Closing … unused" og 0 "No free connection slots" på alle tre (mod 5
+  lukninger i det forrige vindue).
+- Vellykkede pr. minut: bt-proxy-3 steg fra 1,07 til 1,48; bt-proxy-1 og -2 faldt lidt (1,8 → 1,68
+  og 1,97 → 1,81), fordi der kom færre anmodninger (77, 74 og 57 mod 97, 97 og 86). Om det skyldes
+  ændringer på HA-siden i samme tidsrum, ved jeg ikke.
+- "Tabt link" er nu den største fejl (17, 14 og 8): anmodninger, hvor linket blev tabt flere gange,
+  til budgettet var brugt.
 
 ## Forsøg i drift fra 20/11-2026 kl. 15:46
 
