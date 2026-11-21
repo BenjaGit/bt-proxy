@@ -47,6 +47,14 @@
 #           op read 'op://Private/Observability hub/INGEST_PASSWORD_HOME'.
 #           Lægges i /etc/bt-proxy/journal-auth (600 root) og gives til videresenderen som
 #           systemd-credential. Tom = behold den, der allerede ligger der.
+# ZIGBEE=1  del en Zigbee-dongle over nettet med ser2net: rå TCP (ingen telnet/RFC2217) på
+#           ZIGBEE_PORT (standard 6638) til ZIGBEE_DEV (by-id-stien), ZIGBEE_BAUD 8N1 uden
+#           flowkontrol. Kun HA_IP må forbinde. ser2net åbner først porten, når en klient
+#           forbinder, så tjenesten kører også, når donglen ikke sidder i.
+# QNETD=1   corosync-qnetd (tredje stemme, QDevice, til en Proxmox-cluster) på TCP 5403,
+#           kun fra QNETD_PEERS (cluster-knudernes adresser, adskilt af mellemrum).
+#           'pvecm qdevice setup' skriver clusterens certifikat i /etc/corosync/qnetd/nssdb.
+#           Gør det med overlay slået fra; ellers er certifikatet væk efter en genstart.
 # OVERLAY=1 skrivebeskyttet rod (overlayfs, raspi-config) til sidst, så USB-nøglen/
 #           SD-kortet ikke slides. Alt skrevet efter genstarten ligger i RAM. Opdatering:
 #           'sudo bt-proxy-overlay off' + genstart, opdatér, 'sudo bt-proxy-overlay on' +
@@ -65,6 +73,12 @@ DONGLE="${DONGLE:-0}"
 USBWIFI="${USBWIFI:-0}"
 KEEPWIFI="${KEEPWIFI:-0}"
 OVERLAY="${OVERLAY:-0}"
+ZIGBEE="${ZIGBEE:-0}"
+ZIGBEE_DEV="${ZIGBEE_DEV:-/dev/serial/by-id/usb-ITEAD_SONOFF_Zigbee_3.0_USB_Dongle_Plus_V2_20240420152910-if00}"
+ZIGBEE_PORT="${ZIGBEE_PORT:-6638}"
+ZIGBEE_BAUD="${ZIGBEE_BAUD:-115200}"
+QNETD="${QNETD:-0}"
+QNETD_PEERS="${QNETD_PEERS:-192.168.80.2 192.168.90.20}"
 LOG_URL="${LOG_URL-https://obs-ingest.coldberg.dk:443/insert/journald}"
 LOG_USER="${LOG_USER:-home}"
 LOG_PASSWORD="${LOG_PASSWORD-}"
@@ -91,6 +105,12 @@ wifi_off() {
     nmcli -t -f NAME,DEVICE con show --active | grep wlan0 || echo "ADVARSEL: wlan0 er ikke forbundet"
     return
   fi
+  # Frigiv WiFi'ens DHCP-lease først, så dens adresse kan gå til kablet med det samme.
+  for c in $(nmcli -t -f UUID,TYPE con show --active | awk -F: '$2=="802-11-wireless"{print $1}'); do
+    sudo nmcli con modify "$c" ipv4.dhcp-send-release yes 2>/dev/null \
+      && sudo nmcli device reapply wlan0 >/dev/null 2>&1 && sleep 5
+    sudo nmcli con down "$c" >/dev/null 2>&1 && echo "WiFi-forbindelsen er taget ned (lease frigivet)"
+  done
   sudo nmcli radio wifi off && echo "nmcli: wifi off"
   grep -q '^dtoverlay=disable-wifi' "$CFG" || { echo 'dtoverlay=disable-wifi' | sudo tee -a "$CFG"; REBOOT=1; }
 }
@@ -111,6 +131,15 @@ echo "arm_freq: ${ARM_FREQ:-standard}"
 step "Netværk ($NET)"
 case "$NET" in
   eth)
+    # Kablet skal have en adresse, før WiFi slås fra; ellers er Pi'en væk fra nettet.
+    ETH_CON=$(nmcli -t -f NAME,TYPE con show | awk -F: '$2=="802-3-ethernet"{print $1; exit}')
+    [ -n "$ETH_CON" ] || { echo "Ingen kabelprofil i NetworkManager"; exit 1; }
+    sudo nmcli con modify "$ETH_CON" connection.autoconnect yes connection.autoconnect-retries 0 ipv4.method auto
+    ip -4 addr show eth0 | grep -q inet || sudo nmcli con up "$ETH_CON" >/dev/null
+    for _ in $(seq 30); do ip -4 addr show eth0 | grep -q inet && break; sleep 2; done
+    ip -4 addr show eth0 | grep -q inet \
+      || { echo "eth0 fik ingen IPv4; WiFi er urørt. Tjek kabel og switchport."; exit 1; }
+    ip -4 -br addr show eth0
     wifi_off
     ;;
   vlan)
@@ -544,17 +573,54 @@ WantedBy=multi-user.target
 EOF
 echo "bt-proxy-update.timer: hver $UPDATE_WEEKDAY kl. 04:00; besked ved fejl: ${UPDATE_WEBHOOK:-(ingen)}"
 
-step "nftables: kun HA ($HA_IP) må nå 6053"
-sudo tee /etc/nftables.conf >/dev/null <<EOF
-#!/usr/sbin/nft -f
-flush ruleset
-table inet filter {
-  chain input {
-    type filter hook input priority 0; policy accept;
-    tcp dport 6053 ip saddr != $HA_IP drop
-  }
-}
+if [ "$ZIGBEE" = 1 ]; then
+  step "ser2net: Zigbee-dongle på TCP $ZIGBEE_PORT"
+  sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq ser2net >/dev/null && echo "ser2net ok"
+  [ -f /etc/ser2net.yaml.orig ] || sudo cp /etc/ser2net.yaml /etc/ser2net.yaml.orig 2>/dev/null || true
+  sudo tee /etc/ser2net.yaml >/dev/null <<EOF
+%YAML 1.1
+---
+# Skrevet af bt-proxy's setup-pi.sh (ZIGBEE=1).
+# Rå TCP til Zigbee-donglen. Porten åbnes, når en klient forbinder, og lukkes igen
+# bagefter, så ser2net kører også, når donglen ikke sidder i. 'local' = ingen
+# modemstyrelinjer; ingen rtscts/xonxoff = ingen flowkontrol.
+connection: &zigbee
+  accepter: tcp,$ZIGBEE_PORT
+  connector: serialdev,$ZIGBEE_DEV,${ZIGBEE_BAUD}n81,local
+  enable: on
+  options:
+    kickolduser: true
 EOF
+fi
+
+if [ "$QNETD" = 1 ]; then
+  step "corosync-qnetd: QDevice på TCP 5403"
+  sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq corosync-qnetd >/dev/null && echo "corosync-qnetd ok"
+fi
+
+step "nftables: 6053 kun fra HA ($HA_IP)$([ "$ZIGBEE" = 1 ] && echo ", $ZIGBEE_PORT kun fra HA")$([ "$QNETD" = 1 ] && echo ", 5403 kun fra $QNETD_PEERS")"
+# accept + drop pr. port, så også IPv6 til porten afvises.
+{
+  echo '#!/usr/sbin/nft -f'
+  echo 'flush ruleset'
+  echo 'table inet filter {'
+  echo '  chain input {'
+  echo '    type filter hook input priority 0; policy accept;'
+  echo '    iif "lo" accept'
+  echo "    tcp dport 6053 ip saddr $HA_IP accept"
+  echo '    tcp dport 6053 drop'
+  if [ "$ZIGBEE" = 1 ]; then
+    echo "    tcp dport $ZIGBEE_PORT ip saddr $HA_IP accept"
+    echo "    tcp dport $ZIGBEE_PORT drop"
+  fi
+  if [ "$QNETD" = 1 ]; then
+    echo "    tcp dport 5403 ip saddr { $(echo $QNETD_PEERS | sed 's/  */, /g') } accept"
+    echo '    tcp dport 5403 drop'
+  fi
+  echo '  }'
+  echo '}'
+} | sudo tee /etc/nftables.conf >/dev/null
+sudo nft -c -f /etc/nftables.conf || { echo "nftables.conf er ugyldig"; exit 1; }
 
 step "Start"
 sudo systemctl daemon-reload
@@ -562,13 +628,20 @@ sudo systemctl restart systemd-journald bluetooth
 UNITS="nftables bt-proxy bt-proxy-watchdog.timer net-watchdog.timer bt-proxy-update.timer"
 sudo systemctl enable bt-proxy-update-resume.service 2>&1 | grep -v '^Created symlink' || true
 [ -n "$LOG_URL" ] && UNITS="$UNITS bt-proxy-journal-forward systemd-journal-upload"
+[ "$ZIGBEE" = 1 ] && UNITS="$UNITS ser2net"
+[ "$QNETD" = 1 ] && UNITS="$UNITS corosync-qnetd"
 # shellcheck disable=SC2086
 sudo systemctl enable --now $UNITS 2>&1 | grep -v '^Created symlink' || true
 [ -n "$LOG_URL" ] && sudo systemctl restart bt-proxy-journal-forward systemd-journal-upload
+# enable --now genindlæser ikke en tjeneste, der allerede kører.
+sudo nft -f /etc/nftables.conf
+[ "$ZIGBEE" = 1 ] && sudo systemctl restart ser2net
 sleep 15
 # shellcheck disable=SC2086
 systemctl is-active bluetooth $UNITS
-sudo nft list ruleset | grep 6053
+sudo nft list ruleset | grep dport
+[ "$ZIGBEE" = 1 ] && { ss -Hltn "sport = :$ZIGBEE_PORT" | grep -q . && echo "ser2net lytter på $ZIGBEE_PORT" || echo "ADVARSEL: intet lytter på $ZIGBEE_PORT"; ls -l "$ZIGBEE_DEV" 2>/dev/null || echo "Zigbee-donglen sidder ikke i ($ZIGBEE_DEV findes ikke)"; }
+[ "$QNETD" = 1 ] && { ss -Hltn "sport = :5403" | grep -q . && echo "qnetd lytter på 5403" || echo "ADVARSEL: intet lytter på 5403"; }
 journalctl -u bt-proxy -n 15 --no-pager
 ip -4 -br addr | grep -v '^lo'
 ip link show "$MAC_IF" | awk -v i="$MAC_IF" '/ether/{print i, "MAC (til DHCP-reservation):", $2}'

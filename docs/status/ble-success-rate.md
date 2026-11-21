@@ -15,6 +15,14 @@ Undersøgt 20/11-2026 (bestilt af homeassistant). Tre forsøg kører fra 20/11 k
 5. Benjamin vil flytte bt-proxy-3 op på et skab, når han har en forlængerledning. Mål signalet
    igen bagefter med kommandoen under "bt-proxy-3 drejet".
 
+6. **bt-proxy-2 flyttet 21/11 kl. ca. 13:37** fra gildesalen til rack'et i teknikrummet (genstartet,
+   oppe fra 13:37). Følger:
+   - Forsøget med interval 6/12/200 lå i RAM og er væk; målingen for bt-proxy-2 slutter 13:37.
+   - `.11` overlevede genstarten (første rigtige genstart efter den blev gjort permanent).
+   - Kl. 14:21 havde kun `wlan0` en IPv4-adresse (192.168.41.5); kablet i UDM port 2 gav ingen.
+   - 13:41–14:21: 21 ok og 61 fejl (26 %) mod 73 % aftenen før. Gildesalens termostater høres nu
+     med −80 til −89 dBm (`…CF:04:D0` −84, `…B2:77:06` −80, `…B2:AB:96` −89), `…D0:8A:0D` slet ikke.
+
 ## Connect-budget 30 s (`v1.0.3-benjagit.10`, bestilt af danfoss-eco-ha 20/11)
 
 Benjamin sagde ja til to ændringer: tidsgrænsen for en connect-anmodning fra 15 s til 30 s, og
