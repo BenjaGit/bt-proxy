@@ -5,13 +5,12 @@ Bestilt af homeassistant 21/11-2026 (svar til pane w5:pR). Plan på HA-siden:
 
 ## Næste skridt
 
-1. **Venter på homeassistant (21/11 kl. 14:42):** 41.5-reservationen skal flyttes til eth-MAC
-   `b8:27:eb:97:3e:f7`. Pi'en står på kabel med den midlertidige adresse 192.168.41.7 (SSH:
-   `ssh -o HostName=192.168.41.7 -o HostKeyAlias=192.168.41.5 bt-proxy-2`).
-2. Når reservationen er flyttet: `sudo reboot` (overlay er sat til at slå TIL ved næste genstart).
-3. Verificér: `eth0` = 192.168.41.5, `wlan0` væk, bt-proxy aktiv og forbundet til HA, ser2net
-   lytter på 6638, qnetd på 5403, journalen kommer frem i hubben. Svar til w5:pR, og skriv til
-   danfoss-eco-ha (wK:p1), at Pi'en er stabil, med tidsrummene nedenfor.
+Opgaven er færdig og svaret sendt til homeassistant (w5:pR) 21/11 kl. 14:45. Tilbage står kun:
+
+1. Zigbee-donglen flyttes til Pi'en af Benjamin (HA-planens task 5). Tjek bagefter
+   `ls -l /dev/serial/by-id/` og `journalctl -u ser2net` på bt-proxy-2.
+2. Før `pvecm qdevice setup`: slå overlay fra og genstart, og slå det til igen bagefter.
+3. Slet filen, når de to ting er gjort.
 
 ## Forløb 21/11
 
@@ -25,7 +24,11 @@ Bestilt af homeassistant 21/11-2026 (svar til pane w5:pR). Plan på HA-siden:
 - 14:41 testet: ser2net svarer uden dongle med "Device open failure" og lukker; tjenesten kører
   videre. qnetd aktiv, nssdb oprettet.
 
-## Til svaret til homeassistant
+- 14:41:58 genstart med overlay til, oppe 14:42:50. `eth0` = 192.168.41.5 (reservationen flyttet
+  af homeassistant), `wlan0` findes ikke, HA forbundet 14:42:52, ser2net på 6638, qnetd på 5403,
+  journalen i hubben 14:44.
+
+## Givet videre til homeassistant
 
 - `pvecm qdevice setup` skriver clusterens certifikat i `/etc/corosync/qnetd/nssdb`. Under overlay
   ligger det i RAM og er væk efter en genstart: gør det med overlay slået fra.
